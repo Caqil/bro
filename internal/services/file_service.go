@@ -470,7 +470,7 @@ func (s *FileService) GetUserFiles(userID primitive.ObjectID, purpose string, li
 
 	// Get files
 	opts := options.Find().
-		SetSort(bson.D{{"uploaded_at", -1}}).
+		SetSort(bson.D{{Key: "uploaded_at", Value: -1}}).
 		SetLimit(int64(limit)).
 		SetSkip(int64(offset))
 
@@ -509,7 +509,7 @@ func (s *FileService) GetChatFiles(chatID primitive.ObjectID, userID primitive.O
 
 	// Get files
 	opts := options.Find().
-		SetSort(bson.D{{"uploaded_at", -1}}).
+		SetSort(bson.D{{Key: "uploaded_at", Value: -1}}).
 		SetLimit(int64(limit)).
 		SetSkip(int64(offset))
 
@@ -555,7 +555,7 @@ func (s *FileService) SearchFiles(userID primitive.ObjectID, query, contentType 
 
 	// Get files
 	opts := options.Find().
-		SetSort(bson.D{{"uploaded_at", -1}}).
+		SetSort(bson.D{{Key: "uploaded_at", Value: -1}}).
 		SetLimit(int64(limit)).
 		SetSkip(int64(offset))
 
