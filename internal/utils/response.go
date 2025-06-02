@@ -167,8 +167,27 @@ func ErrorWithDetails(c *gin.Context, statusCode int, code, message, details str
 	c.JSON(statusCode, response)
 }
 
-// ValidationError sends a validation error response
-func ValidationError(c *gin.Context, fields map[string]string) {
+// ValidationErrorResponse sends a validation error response using ValidationError from validation.go
+func ValidationErrorResponse(c *gin.Context, errors map[string]ValidationError) {
+	fields := make(map[string]string)
+	for field, err := range errors {
+		fields[field] = err.Message
+	}
+
+	response := APIResponse{
+		Success: false,
+		Error: &APIError{
+			Code:    ErrCodeValidation,
+			Message: "Validation failed",
+			Fields:  fields,
+		},
+		Timestamp: time.Now().Unix(),
+	}
+	c.JSON(http.StatusBadRequest, response)
+}
+
+// SendValidationError sends a validation error response (legacy method)
+func SendValidationError(c *gin.Context, fields map[string]string) {
 	response := APIResponse{
 		Success: false,
 		Error: &APIError{
