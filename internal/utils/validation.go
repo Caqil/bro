@@ -54,7 +54,7 @@ var (
 		"UK":     regexp.MustCompile(`^\+44[1-9]\d{8,9}$`),
 		"IN":     regexp.MustCompile(`^\+91[6-9]\d{9}$`),
 		"ID":     regexp.MustCompile(`^\+62[8]\d{8,11}$`),
-		"GLOBAL": regexp.MustCompile(`^\+[1-9]\d{1,14}$`), // E.164 format
+		"GLOBAL": regexp.MustCompile(`^\+[1-9]\d{1,14}$`),
 	}
 
 	// Email pattern
