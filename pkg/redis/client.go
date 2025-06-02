@@ -1,676 +1,279 @@
 package redis
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
-	"net/url"
 	"strconv"
-	"strings"
-	"sync"
 	"time"
 
-	"github.com/gomodule/redigo/redis"
+	"github.com/go-redis/redis/v8"
 )
 
-// Client represents a Redis client with connection pooling
+// Client wraps Redis client with additional functionality
 type Client struct {
-	pool    *redis.Pool
-	config  *Config
-	mutex   sync.RWMutex
-	hooks   []Hook
-	metrics *Metrics
-}
-
-// Config represents Redis configuration
-type Config struct {
-	URL            string
-	Host           string
-	Port           int
-	Password       string
-	Database       int
-	MaxIdle        int
-	MaxActive      int
-	IdleTimeout    time.Duration
-	ConnectTimeout time.Duration
-	ReadTimeout    time.Duration
-	WriteTimeout   time.Duration
-	MaxRetries     int
-	RetryDelay     time.Duration
-	EnableMetrics  bool
-}
-
-// Hook represents a function that gets called on Redis operations
-type Hook func(operation string, key string, duration time.Duration, err error)
-
-// Metrics represents Redis operation metrics
-type Metrics struct {
-	TotalOperations   int64
-	SuccessfulOps     int64
-	FailedOps         int64
-	TotalDuration     time.Duration
-	AverageDuration   time.Duration
-	ConnectionErrors  int64
-	TimeoutErrors     int64
-	LastOperation     time.Time
-	ActiveConnections int32
-	mutex             sync.RWMutex
+	client *redis.Client
+	ctx    context.Context
 }
 
 // SessionData represents session information stored in Redis
 type SessionData struct {
-	UserID    string                 `json:"user_id"`
-	DeviceID  string                 `json:"device_id"`
-	Platform  string                 `json:"platform"`
-	CreatedAt time.Time              `json:"created_at"`
-	UpdatedAt time.Time              `json:"updated_at"`
-	Data      map[string]interface{} `json:"data"`
+	UserID    string    `json:"user_id"`
+	DeviceID  string    `json:"device_id"`
+	Platform  string    `json:"platform"`
+	IP        string    `json:"ip"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	IsActive  bool      `json:"is_active"`
 }
 
-// CacheItem represents a cached item with metadata
-type CacheItem struct {
-	Key       string      `json:"key"`
-	Value     interface{} `json:"value"`
-	TTL       int64       `json:"ttl"`
-	CreatedAt time.Time   `json:"created_at"`
-	UpdatedAt time.Time   `json:"updated_at"`
+// UserPresence represents user online presence
+type UserPresence struct {
+	UserID     string    `json:"user_id"`
+	IsOnline   bool      `json:"is_online"`
+	LastSeen   time.Time `json:"last_seen"`
+	Platform   string    `json:"platform"`
+	DeviceInfo string    `json:"device_info"`
 }
 
-// PubSubMessage represents a published message
-type PubSubMessage struct {
-	Channel   string                 `json:"channel"`
-	Message   string                 `json:"message"`
-	Data      map[string]interface{} `json:"data,omitempty"`
-	Timestamp time.Time              `json:"timestamp"`
-}
-
-// Global client instance
 var globalClient *Client
-var globalMutex sync.RWMutex
-
-// DefaultConfig returns default Redis configuration
-func DefaultConfig() *Config {
-	return &Config{
-		Host:           "localhost",
-		Port:           6379,
-		Database:       0,
-		MaxIdle:        10,
-		MaxActive:      100,
-		IdleTimeout:    240 * time.Second,
-		ConnectTimeout: 10 * time.Second,
-		ReadTimeout:    30 * time.Second,
-		WriteTimeout:   30 * time.Second,
-		MaxRetries:     3,
-		RetryDelay:     100 * time.Millisecond,
-		EnableMetrics:  true,
-	}
-}
 
 // NewClient creates a new Redis client
 func NewClient(redisURL string) *Client {
-	config := DefaultConfig()
+	if redisURL == "" {
+		redisURL = "redis://localhost:6379"
+	}
 
-	if redisURL != "" {
-		parseRedisURL(redisURL, config)
+	opt, err := redis.ParseURL(redisURL)
+	if err != nil {
+		log.Printf("Failed to parse Redis URL: %v", err)
+		// Fallback to default configuration
+		opt = &redis.Options{
+			Addr:     "localhost:6379",
+			Password: "",
+			DB:       0,
+		}
+	}
+
+	// Configure connection pool
+	opt.PoolSize = 20
+	opt.MinIdleConns = 5
+	opt.MaxRetries = 3
+	//opt.RetryDelay = time.Millisecond * 100
+	opt.DialTimeout = 5 * time.Second
+	opt.ReadTimeout = 3 * time.Second
+	opt.WriteTimeout = 3 * time.Second
+	opt.IdleTimeout = 5 * time.Minute
+
+	rdb := redis.NewClient(opt)
+
+	ctx := context.Background()
+
+	// Test connection
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		log.Printf("Failed to connect to Redis: %v", err)
+		return nil
 	}
 
 	client := &Client{
-		config:  config,
-		hooks:   make([]Hook, 0),
-		metrics: &Metrics{},
+		client: rdb,
+		ctx:    ctx,
 	}
 
-	client.pool = &redis.Pool{
-		MaxIdle:     config.MaxIdle,
-		MaxActive:   config.MaxActive,
-		IdleTimeout: config.IdleTimeout,
-		Wait:        true,
-		Dial: func() (redis.Conn, error) {
-			return client.dial()
-		},
-		TestOnBorrow: func(c redis.Conn, t time.Time) error {
-			if time.Since(t) < time.Minute {
-				return nil
-			}
-			_, err := c.Do("PING")
-			return err
-		},
-	}
-
-	// Set global client
-	globalMutex.Lock()
 	globalClient = client
-	globalMutex.Unlock()
-
-	// Test connection
-	if err := client.Ping(); err != nil {
-		log.Printf("Redis connection test failed: %v", err)
-	} else {
-		log.Printf("Successfully connected to Redis at %s:%d", config.Host, config.Port)
-	}
-
+	log.Printf("Successfully connected to Redis at %s", opt.Addr)
 	return client
 }
 
-// parseRedisURL parses Redis URL and updates config
-func parseRedisURL(redisURL string, config *Config) {
-	config.URL = redisURL
-
-	u, err := url.Parse(redisURL)
-	if err != nil {
-		log.Printf("Invalid Redis URL: %v", err)
-		return
-	}
-
-	if u.Hostname() != "" {
-		config.Host = u.Hostname()
-	}
-
-	if u.Port() != "" {
-		if port, err := strconv.Atoi(u.Port()); err == nil {
-			config.Port = port
-		}
-	}
-
-	if u.User != nil {
-		if password, set := u.User.Password(); set {
-			config.Password = password
-		}
-	}
-
-	if len(u.Path) > 1 {
-		if db, err := strconv.Atoi(u.Path[1:]); err == nil {
-			config.Database = db
-		}
-	}
+// GetClient returns the global Redis client
+func GetClient() *Client {
+	return globalClient
 }
 
-// dial creates a new Redis connection
-func (c *Client) dial() (redis.Conn, error) {
-	address := fmt.Sprintf("%s:%d", c.config.Host, c.config.Port)
-
-	conn, err := redis.DialTimeout(
-		"tcp",
-		address,
-		c.config.ConnectTimeout,
-		c.config.ReadTimeout,
-		c.config.WriteTimeout,
-	)
-
-	if err != nil {
-		c.updateMetrics("dial", "", 0, err)
-		return nil, fmt.Errorf("failed to connect to Redis: %w", err)
+// Close closes the Redis connection
+func (c *Client) Close() error {
+	if c.client != nil {
+		return c.client.Close()
 	}
-
-	// Authenticate if password is provided
-	if c.config.Password != "" {
-		if _, err := conn.Do("AUTH", c.config.Password); err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("Redis authentication failed: %w", err)
-		}
-	}
-
-	// Select database
-	if c.config.Database != 0 {
-		if _, err := conn.Do("SELECT", c.config.Database); err != nil {
-			conn.Close()
-			return nil, fmt.Errorf("failed to select Redis database: %w", err)
-		}
-	}
-
-	return conn, nil
+	return nil
 }
 
-// getConnection gets a connection from the pool
-func (c *Client) getConnection() redis.Conn {
-	return c.pool.Get()
-}
-
-// executeWithRetry executes a Redis command with retry logic
-func (c *Client) executeWithRetry(operation string, key string, fn func(redis.Conn) (interface{}, error)) (interface{}, error) {
-	var lastErr error
-
-	for attempt := 0; attempt <= c.config.MaxRetries; attempt++ {
-		start := time.Now()
-		conn := c.getConnection()
-
-		result, err := fn(conn)
-		duration := time.Since(start)
-
-		conn.Close()
-
-		if err == nil {
-			c.updateMetrics(operation, key, duration, nil)
-			return result, nil
-		}
-
-		lastErr = err
-		c.updateMetrics(operation, key, duration, err)
-
-		if attempt < c.config.MaxRetries {
-			time.Sleep(c.config.RetryDelay * time.Duration(attempt+1))
-		}
-	}
-
-	return nil, fmt.Errorf("Redis operation failed after %d retries: %w", c.config.MaxRetries, lastErr)
-}
-
-// updateMetrics updates operation metrics
-func (c *Client) updateMetrics(operation string, key string, duration time.Duration, err error) {
-	if !c.config.EnableMetrics {
-		return
-	}
-
-	c.metrics.mutex.Lock()
-	defer c.metrics.mutex.Unlock()
-
-	c.metrics.TotalOperations++
-	c.metrics.TotalDuration += duration
-	c.metrics.AverageDuration = c.metrics.TotalDuration / time.Duration(c.metrics.TotalOperations)
-	c.metrics.LastOperation = time.Now()
-
-	if err != nil {
-		c.metrics.FailedOps++
-		if strings.Contains(err.Error(), "connection") {
-			c.metrics.ConnectionErrors++
-		}
-		if strings.Contains(err.Error(), "timeout") {
-			c.metrics.TimeoutErrors++
-		}
-	} else {
-		c.metrics.SuccessfulOps++
-	}
-
-	// Execute hooks
-	for _, hook := range c.hooks {
-		go hook(operation, key, duration, err)
-	}
+// Health checks Redis connection health
+func (c *Client) Health() error {
+	return c.client.Ping(c.ctx).Err()
 }
 
 // Basic Redis Operations
 
-// Ping tests the Redis connection
-func (c *Client) Ping() error {
-	_, err := c.executeWithRetry("PING", "", func(conn redis.Conn) (interface{}, error) {
-		return conn.Do("PING")
-	})
-	return err
-}
-
-// Set sets a key-value pair
-func (c *Client) Set(key string, value interface{}) error {
-	data, err := json.Marshal(value)
-	if err != nil {
-		return fmt.Errorf("failed to marshal value: %w", err)
-	}
-
-	_, err = c.executeWithRetry("SET", key, func(conn redis.Conn) (interface{}, error) {
-		return conn.Do("SET", key, data)
-	})
-	return err
-}
-
-// SetEX sets a key-value pair with expiration
-func (c *Client) SetEX(key string, value interface{}, expiration time.Duration) error {
-	data, err := json.Marshal(value)
-	if err != nil {
-		return fmt.Errorf("failed to marshal value: %w", err)
-	}
-
-	_, err = c.executeWithRetry("SETEX", key, func(conn redis.Conn) (interface{}, error) {
-		return conn.Do("SETEX", key, int(expiration.Seconds()), data)
-	})
-	return err
+// Set sets a key-value pair with optional expiration
+func (c *Client) Set(key string, value interface{}, expiration time.Duration) error {
+	return c.client.Set(c.ctx, key, value, expiration).Err()
 }
 
 // Get gets a value by key
-func (c *Client) Get(key string) ([]byte, error) {
-	result, err := c.executeWithRetry("GET", key, func(conn redis.Conn) (interface{}, error) {
-		return conn.Do("GET", key)
-	})
-
-	if err != nil {
-		return nil, err
-	}
-
-	if result == nil {
-		return nil, fmt.Errorf("key not found: %s", key)
-	}
-
-	data, ok := result.([]byte)
-	if !ok {
-		return nil, fmt.Errorf("unexpected data type for key: %s", key)
-	}
-
-	return data, nil
-}
-
-// GetJSON gets a value and unmarshals it from JSON
-func (c *Client) GetJSON(key string, dest interface{}) error {
-	data, err := c.Get(key)
-	if err != nil {
-		return err
-	}
-
-	if err := json.Unmarshal(data, dest); err != nil {
-		return fmt.Errorf("failed to unmarshal JSON: %w", err)
-	}
-
-	return nil
-}
-
-// Exists checks if a key exists
-func (c *Client) Exists(key string) (bool, error) {
-	result, err := c.executeWithRetry("EXISTS", key, func(conn redis.Conn) (interface{}, error) {
-		return conn.Do("EXISTS", key)
-	})
-
-	if err != nil {
-		return false, err
-	}
-
-	count, ok := result.(int64)
-	if !ok {
-		return false, fmt.Errorf("unexpected result type for EXISTS")
-	}
-
-	return count > 0, nil
+func (c *Client) Get(key string) (string, error) {
+	return c.client.Get(c.ctx, key).Result()
 }
 
 // Delete deletes a key
 func (c *Client) Delete(key string) error {
-	_, err := c.executeWithRetry("DEL", key, func(conn redis.Conn) (interface{}, error) {
-		return conn.Do("DEL", key)
-	})
-	return err
+	return c.client.Del(c.ctx, key).Err()
+}
+
+// Exists checks if a key exists
+func (c *Client) Exists(key string) (bool, error) {
+	count, err := c.client.Exists(c.ctx, key).Result()
+	return count > 0, err
 }
 
 // Expire sets expiration for a key
 func (c *Client) Expire(key string, expiration time.Duration) error {
-	_, err := c.executeWithRetry("EXPIRE", key, func(conn redis.Conn) (interface{}, error) {
-		return conn.Do("EXPIRE", key, int(expiration.Seconds()))
-	})
-	return err
+	return c.client.Expire(c.ctx, key, expiration).Err()
 }
 
-// TTL returns the time to live for a key
+// TTL returns time to live for a key
 func (c *Client) TTL(key string) (time.Duration, error) {
-	result, err := c.executeWithRetry("TTL", key, func(conn redis.Conn) (interface{}, error) {
-		return conn.Do("TTL", key)
-	})
-
-	if err != nil {
-		return 0, err
-	}
-
-	seconds, ok := result.(int64)
-	if !ok {
-		return 0, fmt.Errorf("unexpected result type for TTL")
-	}
-
-	if seconds < 0 {
-		return 0, nil // Key doesn't exist or has no expiration
-	}
-
-	return time.Duration(seconds) * time.Second, nil
+	return c.client.TTL(c.ctx, key).Result()
 }
 
-// Increment increments a key by 1
-func (c *Client) Increment(key string) (int64, error) {
-	result, err := c.executeWithRetry("INCR", key, func(conn redis.Conn) (interface{}, error) {
-		return conn.Do("INCR", key)
-	})
+// JSON Operations
 
+// SetJSON sets a JSON object
+func (c *Client) SetJSON(key string, value interface{}, expiration time.Duration) error {
+	jsonData, err := json.Marshal(value)
 	if err != nil {
-		return 0, err
+		return fmt.Errorf("failed to marshal JSON: %w", err)
 	}
-
-	value, ok := result.(int64)
-	if !ok {
-		return 0, fmt.Errorf("unexpected result type for INCR")
-	}
-
-	return value, nil
+	return c.client.Set(c.ctx, key, jsonData, expiration).Err()
 }
 
-// IncrementBy increments a key by a specific amount
-func (c *Client) IncrementBy(key string, amount int64) (int64, error) {
-	result, err := c.executeWithRetry("INCRBY", key, func(conn redis.Conn) (interface{}, error) {
-		return conn.Do("INCRBY", key, amount)
-	})
-
+// GetJSON gets a JSON object
+func (c *Client) GetJSON(key string, dest interface{}) error {
+	data, err := c.client.Get(c.ctx, key).Result()
 	if err != nil {
-		return 0, err
+		return err
 	}
+	return json.Unmarshal([]byte(data), dest)
+}
 
-	value, ok := result.(int64)
-	if !ok {
-		return 0, fmt.Errorf("unexpected result type for INCRBY")
-	}
-
-	return value, nil
+// SetEX sets a key with expiration
+func (c *Client) SetEX(key string, value interface{}, expiration time.Duration) error {
+	return c.client.SetEX(c.ctx, key, value, expiration).Err()
 }
 
 // List Operations
 
-// ListPush pushes an item to the left of a list
-func (c *Client) ListPush(key string, value interface{}) error {
-	data, err := json.Marshal(value)
-	if err != nil {
-		return fmt.Errorf("failed to marshal value: %w", err)
-	}
-
-	_, err = c.executeWithRetry("LPUSH", key, func(conn redis.Conn) (interface{}, error) {
-		return conn.Do("LPUSH", key, data)
-	})
-	return err
+// LPush pushes elements to the left of a list
+func (c *Client) LPush(key string, values ...interface{}) error {
+	return c.client.LPush(c.ctx, key, values...).Err()
 }
 
-// ListPop pops an item from the left of a list
-func (c *Client) ListPop(key string) ([]byte, error) {
-	result, err := c.executeWithRetry("LPOP", key, func(conn redis.Conn) (interface{}, error) {
-		return conn.Do("LPOP", key)
-	})
-
-	if err != nil {
-		return nil, err
-	}
-
-	if result == nil {
-		return nil, fmt.Errorf("list is empty: %s", key)
-	}
-
-	data, ok := result.([]byte)
-	if !ok {
-		return nil, fmt.Errorf("unexpected data type")
-	}
-
-	return data, nil
+// RPush pushes elements to the right of a list
+func (c *Client) RPush(key string, values ...interface{}) error {
+	return c.client.RPush(c.ctx, key, values...).Err()
 }
 
-// ListLength returns the length of a list
-func (c *Client) ListLength(key string) (int64, error) {
-	result, err := c.executeWithRetry("LLEN", key, func(conn redis.Conn) (interface{}, error) {
-		return conn.Do("LLEN", key)
-	})
+// LPop pops an element from the left of a list
+func (c *Client) LPop(key string) (string, error) {
+	return c.client.LPop(c.ctx, key).Result()
+}
 
-	if err != nil {
-		return 0, err
-	}
+// RPop pops an element from the right of a list
+func (c *Client) RPop(key string) (string, error) {
+	return c.client.RPop(c.ctx, key).Result()
+}
 
-	length, ok := result.(int64)
-	if !ok {
-		return 0, fmt.Errorf("unexpected result type for LLEN")
-	}
+// LRange gets a range of elements from a list
+func (c *Client) LRange(key string, start, stop int64) ([]string, error) {
+	return c.client.LRange(c.ctx, key, start, stop).Result()
+}
 
-	return length, nil
+// LLen returns the length of a list
+func (c *Client) LLen(key string) (int64, error) {
+	return c.client.LLen(c.ctx, key).Result()
 }
 
 // Set Operations
 
-// SetAdd adds members to a set
-func (c *Client) SetAdd(key string, members ...interface{}) error {
-	args := make([]interface{}, len(members)+1)
-	args[0] = key
-
-	for i, member := range members {
-		data, err := json.Marshal(member)
-		if err != nil {
-			return fmt.Errorf("failed to marshal member: %w", err)
-		}
-		args[i+1] = data
-	}
-
-	_, err := c.executeWithRetry("SADD", key, func(conn redis.Conn) (interface{}, error) {
-		return conn.Do("SADD", args...)
-	})
-	return err
+// SAdd adds members to a set
+func (c *Client) SAdd(key string, members ...interface{}) error {
+	return c.client.SAdd(c.ctx, key, members...).Err()
 }
 
-// SetMembers returns all members of a set
-func (c *Client) SetMembers(key string) ([][]byte, error) {
-	result, err := c.executeWithRetry("SMEMBERS", key, func(conn redis.Conn) (interface{}, error) {
-		return conn.Do("SMEMBERS", key)
-	})
-
-	if err != nil {
-		return nil, err
-	}
-
-	members, err := redis.ByteSlices(result, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to convert result: %w", err)
-	}
-
-	return members, nil
+// SRem removes members from a set
+func (c *Client) SRem(key string, members ...interface{}) error {
+	return c.client.SRem(c.ctx, key, members...).Err()
 }
 
-// SetIsMember checks if a value is a member of a set
-func (c *Client) SetIsMember(key string, member interface{}) (bool, error) {
-	data, err := json.Marshal(member)
-	if err != nil {
-		return false, fmt.Errorf("failed to marshal member: %w", err)
-	}
+// SMembers returns all members of a set
+func (c *Client) SMembers(key string) ([]string, error) {
+	return c.client.SMembers(c.ctx, key).Result()
+}
 
-	result, err := c.executeWithRetry("SISMEMBER", key, func(conn redis.Conn) (interface{}, error) {
-		return conn.Do("SISMEMBER", key, data)
-	})
-
-	if err != nil {
-		return false, err
-	}
-
-	isMember, ok := result.(int64)
-	if !ok {
-		return false, fmt.Errorf("unexpected result type for SISMEMBER")
-	}
-
-	return isMember == 1, nil
+// SIsMember checks if a value is a member of a set
+func (c *Client) SIsMember(key string, member interface{}) (bool, error) {
+	return c.client.SIsMember(c.ctx, key, member).Result()
 }
 
 // Hash Operations
 
-// HashSet sets a field in a hash
-func (c *Client) HashSet(key, field string, value interface{}) error {
-	data, err := json.Marshal(value)
-	if err != nil {
-		return fmt.Errorf("failed to marshal value: %w", err)
-	}
-
-	_, err = c.executeWithRetry("HSET", key, func(conn redis.Conn) (interface{}, error) {
-		return conn.Do("HSET", key, field, data)
-	})
-	return err
+// HSet sets fields in a hash
+func (c *Client) HSet(key string, values ...interface{}) error {
+	return c.client.HSet(c.ctx, key, values...).Err()
 }
 
-// HashGet gets a field from a hash
-func (c *Client) HashGet(key, field string) ([]byte, error) {
-	result, err := c.executeWithRetry("HGET", key, func(conn redis.Conn) (interface{}, error) {
-		return conn.Do("HGET", key, field)
-	})
-
-	if err != nil {
-		return nil, err
-	}
-
-	if result == nil {
-		return nil, fmt.Errorf("field not found: %s", field)
-	}
-
-	data, ok := result.([]byte)
-	if !ok {
-		return nil, fmt.Errorf("unexpected data type")
-	}
-
-	return data, nil
+// HGet gets a field from a hash
+func (c *Client) HGet(key, field string) (string, error) {
+	return c.client.HGet(c.ctx, key, field).Result()
 }
 
-// HashGetAll gets all fields and values from a hash
-func (c *Client) HashGetAll(key string) (map[string][]byte, error) {
-	result, err := c.executeWithRetry("HGETALL", key, func(conn redis.Conn) (interface{}, error) {
-		return conn.Do("HGETALL", key)
-	})
-
-	if err != nil {
-		return nil, err
-	}
-
-	values, err := redis.ByteSlices(result, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to convert result: %w", err)
-	}
-
-	hash := make(map[string][]byte)
-	for i := 0; i < len(values); i += 2 {
-		if i+1 < len(values) {
-			hash[string(values[i])] = values[i+1]
-		}
-	}
-
-	return hash, nil
+// HGetAll gets all fields and values from a hash
+func (c *Client) HGetAll(key string) (map[string]string, error) {
+	return c.client.HGetAll(c.ctx, key).Result()
 }
 
-// Pub/Sub Operations
-
-// Publish publishes a message to a channel
-func (c *Client) Publish(channel string, message interface{}) error {
-	data, err := json.Marshal(message)
-	if err != nil {
-		return fmt.Errorf("failed to marshal message: %w", err)
-	}
-
-	_, err = c.executeWithRetry("PUBLISH", channel, func(conn redis.Conn) (interface{}, error) {
-		return conn.Do("PUBLISH", channel, data)
-	})
-	return err
+// HDel deletes fields from a hash
+func (c *Client) HDel(key string, fields ...string) error {
+	return c.client.HDel(c.ctx, key, fields...).Err()
 }
 
-// Subscribe subscribes to channels and returns a PubSubConn
-func (c *Client) Subscribe(channels ...string) (*redis.PubSubConn, error) {
-	conn := c.getConnection()
-	psc := &redis.PubSubConn{Conn: conn}
+// Counter Operations
 
-	if err := psc.Subscribe(redis.Args{}.AddFlat(channels)...); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("failed to subscribe: %w", err)
-	}
-
-	return psc, nil
+// Increment increments a counter by 1
+func (c *Client) Increment(key string) (int64, error) {
+	return c.client.Incr(c.ctx, key).Result()
 }
 
-// Chat Application Specific Methods
+// IncrementBy increments a counter by a specific value
+func (c *Client) IncrementBy(key string, value int64) (int64, error) {
+	return c.client.IncrBy(c.ctx, key, value).Result()
+}
+
+// Decrement decrements a counter by 1
+func (c *Client) Decrement(key string) (int64, error) {
+	return c.client.Decr(c.ctx, key).Result()
+}
+
+// DecrementBy decrements a counter by a specific value
+func (c *Client) DecrementBy(key string, value int64) (int64, error) {
+	return c.client.DecrBy(c.ctx, key, value).Result()
+}
+
+// Session Management
 
 // SetSession stores session data
-func (c *Client) SetSession(sessionID string, data *SessionData, expiration time.Duration) error {
+func (c *Client) SetSession(sessionID string, session *SessionData, expiration time.Duration) error {
 	key := fmt.Sprintf("session:%s", sessionID)
-	return c.SetEX(key, data, expiration)
+	return c.SetJSON(key, session, expiration)
 }
 
 // GetSession retrieves session data
 func (c *Client) GetSession(sessionID string) (*SessionData, error) {
 	key := fmt.Sprintf("session:%s", sessionID)
 	var session SessionData
-	if err := c.GetJSON(key, &session); err != nil {
+	err := c.GetJSON(key, &session)
+	if err != nil {
 		return nil, err
 	}
 	return &session, nil
@@ -682,203 +285,287 @@ func (c *Client) DeleteSession(sessionID string) error {
 	return c.Delete(key)
 }
 
-// SetUserOnline sets user online status
-func (c *Client) SetUserOnline(userID string, deviceID string, expiration time.Duration) error {
-	key := fmt.Sprintf("user:online:%s", userID)
-	data := map[string]interface{}{
-		"device_id":   deviceID,
-		"last_active": time.Now(),
-	}
-	return c.SetEX(key, data, expiration)
-}
-
-// IsUserOnline checks if user is online
-func (c *Client) IsUserOnline(userID string) (bool, error) {
-	key := fmt.Sprintf("user:online:%s", userID)
-	return c.Exists(key)
-}
-
-// SetUserOffline removes user online status
-func (c *Client) SetUserOffline(userID string) error {
-	key := fmt.Sprintf("user:online:%s", userID)
-	return c.Delete(key)
-}
-
-// CacheMessage caches a message
-func (c *Client) CacheMessage(messageID string, message interface{}, expiration time.Duration) error {
-	key := fmt.Sprintf("message:%s", messageID)
-	return c.SetEX(key, message, expiration)
-}
-
-// GetCachedMessage retrieves a cached message
-func (c *Client) GetCachedMessage(messageID string, dest interface{}) error {
-	key := fmt.Sprintf("message:%s", messageID)
-	return c.GetJSON(key, dest)
-}
-
-// RateLimitCheck checks and updates rate limit
-func (c *Client) RateLimitCheck(identifier string, limit int64, window time.Duration) (bool, error) {
-	key := fmt.Sprintf("rate_limit:%s", identifier)
-
-	count, err := c.IncrementBy(key, 1)
-	if err != nil {
-		return false, err
+// UpdateSessionActivity updates session last activity
+func (c *Client) UpdateSessionActivity(sessionID string) error {
+	key := fmt.Sprintf("session:%s", sessionID)
+	exists, err := c.Exists(key)
+	if err != nil || !exists {
+		return err
 	}
 
-	if count == 1 {
-		// First request, set expiration
-		if err := c.Expire(key, window); err != nil {
-			return false, err
-		}
-	}
-
-	return count <= limit, nil
-}
-
-// AddToQueue adds an item to a processing queue
-func (c *Client) AddToQueue(queueName string, item interface{}) error {
-	key := fmt.Sprintf("queue:%s", queueName)
-	return c.ListPush(key, item)
-}
-
-// GetFromQueue gets an item from a processing queue
-func (c *Client) GetFromQueue(queueName string, dest interface{}) error {
-	key := fmt.Sprintf("queue:%s", queueName)
-	data, err := c.ListPop(key)
+	session, err := c.GetSession(sessionID)
 	if err != nil {
 		return err
 	}
 
-	return json.Unmarshal(data, dest)
+	session.UpdatedAt = time.Now()
+	return c.SetSession(sessionID, session, 24*time.Hour)
 }
 
-// Management Methods
+// User Presence Management
 
-// AddHook adds a hook function
-func (c *Client) AddHook(hook Hook) {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
-	c.hooks = append(c.hooks, hook)
+// SetUserOnline sets user as online
+func (c *Client) SetUserOnline(userID, platform string, expiration time.Duration) error {
+	key := fmt.Sprintf("presence:%s", userID)
+	presence := &UserPresence{
+		UserID:   userID,
+		IsOnline: true,
+		LastSeen: time.Now(),
+		Platform: platform,
+	}
+	return c.SetJSON(key, presence, expiration)
 }
 
-// GetMetrics returns current metrics
-func (c *Client) GetMetrics() *Metrics {
-	c.metrics.mutex.RLock()
-	defer c.metrics.mutex.RUnlock()
+// SetUserOffline sets user as offline
+func (c *Client) SetUserOffline(userID string) error {
+	key := fmt.Sprintf("presence:%s", userID)
+	presence := &UserPresence{
+		UserID:   userID,
+		IsOnline: false,
+		LastSeen: time.Now(),
+	}
+	return c.SetJSON(key, presence, 24*time.Hour)
+}
 
-	// Return a copy
-	return &Metrics{
-		TotalOperations:   c.metrics.TotalOperations,
-		SuccessfulOps:     c.metrics.SuccessfulOps,
-		FailedOps:         c.metrics.FailedOps,
-		TotalDuration:     c.metrics.TotalDuration,
-		AverageDuration:   c.metrics.AverageDuration,
-		ConnectionErrors:  c.metrics.ConnectionErrors,
-		TimeoutErrors:     c.metrics.TimeoutErrors,
-		LastOperation:     c.metrics.LastOperation,
-		ActiveConnections: c.metrics.ActiveConnections,
+// GetUserPresence gets user presence
+func (c *Client) GetUserPresence(userID string) (*UserPresence, error) {
+	key := fmt.Sprintf("presence:%s", userID)
+	var presence UserPresence
+	err := c.GetJSON(key, &presence)
+	if err != nil {
+		return nil, err
+	}
+	return &presence, nil
+}
+
+// IsUserOnline checks if user is online
+func (c *Client) IsUserOnline(userID string) (bool, error) {
+	presence, err := c.GetUserPresence(userID)
+	if err != nil {
+		return false, err
+	}
+	return presence.IsOnline, nil
+}
+
+// Cache Management
+
+// SetCache sets cache with expiration
+func (c *Client) SetCache(key string, value interface{}, expiration time.Duration) error {
+	cacheKey := fmt.Sprintf("cache:%s", key)
+	return c.SetJSON(cacheKey, value, expiration)
+}
+
+// GetCache gets cache
+func (c *Client) GetCache(key string, dest interface{}) error {
+	cacheKey := fmt.Sprintf("cache:%s", key)
+	return c.GetJSON(cacheKey, dest)
+}
+
+// DeleteCache deletes cache
+func (c *Client) DeleteCache(key string) error {
+	cacheKey := fmt.Sprintf("cache:%s", key)
+	return c.Delete(cacheKey)
+}
+
+// Rate Limiting
+
+// CheckRateLimit checks rate limit for a key
+func (c *Client) CheckRateLimit(key string, limit int64, window time.Duration) (bool, int64, error) {
+	current, err := c.IncrementBy(key, 1)
+	if err != nil {
+		return false, 0, err
+	}
+
+	if current == 1 {
+		// First request, set expiration
+		c.Expire(key, window)
+	}
+
+	return current <= limit, limit - current, nil
+}
+
+// ResetRateLimit resets rate limit for a key
+func (c *Client) ResetRateLimit(key string) error {
+	return c.Delete(key)
+}
+
+// Chat Room Management
+
+// JoinChatRoom adds user to chat room
+func (c *Client) JoinChatRoom(chatID, userID string) error {
+	key := fmt.Sprintf("chat_room:%s", chatID)
+	return c.SAdd(key, userID)
+}
+
+// LeaveChatRoom removes user from chat room
+func (c *Client) LeaveChatRoom(chatID, userID string) error {
+	key := fmt.Sprintf("chat_room:%s", chatID)
+	return c.SRem(key, userID)
+}
+
+// GetChatRoomMembers gets all members in a chat room
+func (c *Client) GetChatRoomMembers(chatID string) ([]string, error) {
+	key := fmt.Sprintf("chat_room:%s", chatID)
+	return c.SMembers(key)
+}
+
+// IsInChatRoom checks if user is in chat room
+func (c *Client) IsInChatRoom(chatID, userID string) (bool, error) {
+	key := fmt.Sprintf("chat_room:%s", chatID)
+	return c.SIsMember(key, userID)
+}
+
+// Notification Queue
+
+// PushNotification pushes notification to queue
+func (c *Client) PushNotification(userID string, notification interface{}) error {
+	key := fmt.Sprintf("notifications:%s", userID)
+	jsonData, err := json.Marshal(notification)
+	if err != nil {
+		return err
+	}
+	return c.LPush(key, jsonData)
+}
+
+// PopNotification pops notification from queue
+func (c *Client) PopNotification(userID string) (string, error) {
+	key := fmt.Sprintf("notifications:%s", userID)
+	return c.RPop(key)
+}
+
+// GetNotificationCount gets notification count
+func (c *Client) GetNotificationCount(userID string) (int64, error) {
+	key := fmt.Sprintf("notifications:%s", userID)
+	return c.LLen(key)
+}
+
+// Typing Indicators
+
+// SetTypingIndicator sets typing indicator
+func (c *Client) SetTypingIndicator(chatID, userID string, isTyping bool) error {
+	key := fmt.Sprintf("typing:%s", chatID)
+	if isTyping {
+		return c.SAdd(key, userID)
+	} else {
+		return c.SRem(key, userID)
 	}
 }
 
-// ResetMetrics resets all metrics
-func (c *Client) ResetMetrics() {
-	c.metrics.mutex.Lock()
-	defer c.metrics.mutex.Unlock()
-
-	c.metrics.TotalOperations = 0
-	c.metrics.SuccessfulOps = 0
-	c.metrics.FailedOps = 0
-	c.metrics.TotalDuration = 0
-	c.metrics.AverageDuration = 0
-	c.metrics.ConnectionErrors = 0
-	c.metrics.TimeoutErrors = 0
+// GetTypingUsers gets users who are typing
+func (c *Client) GetTypingUsers(chatID string) ([]string, error) {
+	key := fmt.Sprintf("typing:%s", chatID)
+	return c.SMembers(key)
 }
 
-// HealthCheck performs a health check
-func (c *Client) HealthCheck() map[string]interface{} {
-	health := map[string]interface{}{
-		"status": "unhealthy",
+// WebRTC Signaling
+
+// SetWebRTCOffer sets WebRTC offer
+func (c *Client) SetWebRTCOffer(callID string, offer interface{}) error {
+	key := fmt.Sprintf("webrtc_offer:%s", callID)
+	return c.SetJSON(key, offer, 5*time.Minute)
+}
+
+// GetWebRTCOffer gets WebRTC offer
+func (c *Client) GetWebRTCOffer(callID string) (interface{}, error) {
+	key := fmt.Sprintf("webrtc_offer:%s", callID)
+	var offer interface{}
+	err := c.GetJSON(key, &offer)
+	return offer, err
+}
+
+// SetWebRTCAnswer sets WebRTC answer
+func (c *Client) SetWebRTCAnswer(callID string, answer interface{}) error {
+	key := fmt.Sprintf("webrtc_answer:%s", callID)
+	return c.SetJSON(key, answer, 5*time.Minute)
+}
+
+// GetWebRTCAnswer gets WebRTC answer
+func (c *Client) GetWebRTCAnswer(callID string) (interface{}, error) {
+	key := fmt.Sprintf("webrtc_answer:%s", callID)
+	var answer interface{}
+	err := c.GetJSON(key, &answer)
+	return answer, err
+}
+
+// ICE Candidate Management
+
+// AddICECandidate adds ICE candidate
+func (c *Client) AddICECandidate(callID string, candidate interface{}) error {
+	key := fmt.Sprintf("ice_candidates:%s", callID)
+	jsonData, err := json.Marshal(candidate)
+	if err != nil {
+		return err
 	}
-
-	start := time.Now()
-	if err := c.Ping(); err != nil {
-		health["error"] = err.Error()
-		health["latency_ms"] = time.Since(start).Milliseconds()
-		return health
-	}
-
-	latency := time.Since(start)
-	health["status"] = "healthy"
-	health["latency_ms"] = latency.Milliseconds()
-	health["metrics"] = c.GetMetrics()
-	health["pool_stats"] = map[string]interface{}{
-		"active_count": c.pool.ActiveCount(),
-		"idle_count":   c.pool.IdleCount(),
-	}
-
-	return health
+	return c.LPush(key, jsonData)
 }
 
-// FlushAll flushes all data (use with caution)
-func (c *Client) FlushAll() error {
-	_, err := c.executeWithRetry("FLUSHALL", "", func(conn redis.Conn) (interface{}, error) {
-		return conn.Do("FLUSHALL")
-	})
-	return err
+// GetICECandidates gets all ICE candidates
+func (c *Client) GetICECandidates(callID string) ([]string, error) {
+	key := fmt.Sprintf("ice_candidates:%s", callID)
+	return c.LRange(key, 0, -1)
 }
 
-// Close closes the Redis client
-func (c *Client) Close() error {
-	return c.pool.Close()
+// ClearICECandidates clears ICE candidates
+func (c *Client) ClearICECandidates(callID string) error {
+	key := fmt.Sprintf("ice_candidates:%s", callID)
+	return c.Delete(key)
 }
 
-// Global functions
+// Statistics and Monitoring
 
-// GetClient returns the global Redis client
-func GetClient() *Client {
-	globalMutex.RLock()
-	defer globalMutex.RUnlock()
-	return globalClient
+// GetConnectionCount gets current connection count
+func (c *Client) GetConnectionCount() (int64, error) {
+	return c.client.DBSize(c.ctx).Result()
 }
 
-// Global convenience functions
+// GetInfo gets Redis info
+func (c *Client) GetInfo() (string, error) {
+	return c.client.Info(c.ctx).Result()
+}
 
-// Set sets a key-value pair using the global client
-func Set(key string, value interface{}) error {
+// FlushDB flushes current database (use with caution)
+func (c *Client) FlushDB() error {
+	return c.client.FlushDB(c.ctx).Err()
+}
+
+// Keys returns all keys matching pattern
+func (c *Client) Keys(pattern string) ([]string, error) {
+	return c.client.Keys(c.ctx, pattern).Result()
+}
+
+// Utility Functions
+
+// GenerateKey generates a Redis key with prefix
+func GenerateKey(prefix, id string) string {
+	return fmt.Sprintf("%s:%s", prefix, id)
+}
+
+// ParseCounter parses counter value
+func ParseCounter(value string) (int64, error) {
+	return strconv.ParseInt(value, 10, 64)
+}
+
+// PubSub Operations
+
+// Publish publishes a message to a channel
+func (c *Client) Publish(channel string, message interface{}) error {
+	return c.client.Publish(c.ctx, channel, message).Err()
+}
+
+// Subscribe subscribes to channels
+func (c *Client) Subscribe(channels ...string) *redis.PubSub {
+	return c.client.Subscribe(c.ctx, channels...)
+}
+
+// PSubscribe subscribes to pattern
+func (c *Client) PSubscribe(patterns ...string) *redis.PubSub {
+	return c.client.PSubscribe(c.ctx, patterns...)
+}
+
+// Health Check
+func Health() error {
 	if globalClient == nil {
 		return fmt.Errorf("Redis client not initialized")
 	}
-	return globalClient.Set(key, value)
-}
-
-// Get gets a value by key using the global client
-func Get(key string) ([]byte, error) {
-	if globalClient == nil {
-		return nil, fmt.Errorf("Redis client not initialized")
-	}
-	return globalClient.Get(key)
-}
-
-// Delete deletes a key using the global client
-func Delete(key string) error {
-	if globalClient == nil {
-		return fmt.Errorf("Redis client not initialized")
-	}
-	return globalClient.Delete(key)
-}
-
-// Exists checks if a key exists using the global client
-func Exists(key string) (bool, error) {
-	if globalClient == nil {
-		return false, fmt.Errorf("Redis client not initialized")
-	}
-	return globalClient.Exists(key)
-}
-
-// Publish publishes a message using the global client
-func Publish(channel string, message interface{}) error {
-	if globalClient == nil {
-		return fmt.Errorf("Redis client not initialized")
-	}
-	return globalClient.Publish(channel, message)
+	return globalClient.Health()
 }

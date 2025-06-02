@@ -1,736 +1,317 @@
 package logger
 
 import (
-	"fmt"
 	"io"
 	"log"
 	"os"
-	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"time"
+
+	"github.com/sirupsen/logrus"
 )
 
-// LogLevel represents the severity level of a log message
-type LogLevel int
-
-const (
-	DEBUG LogLevel = iota
-	INFO
-	WARN
-	ERROR
-	FATAL
-)
-
-// String returns the string representation of log level
-func (l LogLevel) String() string {
-	switch l {
-	case DEBUG:
-		return "DEBUG"
-	case INFO:
-		return "INFO"
-	case WARN:
-		return "WARN"
-	case ERROR:
-		return "ERROR"
-	case FATAL:
-		return "FATAL"
-	default:
-		return "UNKNOWN"
-	}
-}
-
-// Color codes for different log levels
-var levelColors = map[LogLevel]string{
-	DEBUG: "\033[36m", // Cyan
-	INFO:  "\033[32m", // Green
-	WARN:  "\033[33m", // Yellow
-	ERROR: "\033[31m", // Red
-	FATAL: "\033[35m", // Magenta
-}
-
-const colorReset = "\033[0m"
-
-// Logger represents the main logger instance
+// Logger represents the application logger
 type Logger struct {
-	level          LogLevel
-	output         io.Writer
-	fileOutput     io.Writer
-	enableColors   bool
-	enableCaller   bool
-	enableTime     bool
-	timeFormat     string
-	prefix         string
-	mutex          sync.Mutex
-	fields         map[string]interface{}
-	hooks          []Hook
-	rotateConfig   *RotateConfig
-	currentLogFile *os.File
+	*logrus.Logger
 }
 
-// Hook represents a function that gets called on each log entry
-type Hook func(level LogLevel, message string, fields map[string]interface{})
+// Fields type for structured logging
+type Fields map[string]interface{}
 
-// RotateConfig represents log rotation configuration
-type RotateConfig struct {
-	MaxSize    int64         // Maximum size in bytes before rotation
-	MaxAge     time.Duration // Maximum age before rotation
-	MaxBackups int           // Maximum number of backup files to keep
-	Compress   bool          // Whether to compress rotated files
-	LogDir     string        // Directory to store log files
-	Filename   string        // Base filename for log files
-}
+var (
+	appLogger *Logger
+)
 
 // Config represents logger configuration
 type Config struct {
 	Level        string
-	Output       string // "console", "file", "both"
-	Format       string // "text", "json"
-	EnableColors bool
+	Format       string // "json" or "text"
+	Output       string // "stdout", "stderr", or file path
 	EnableCaller bool
-	LogDir       string
-	Filename     string
-	MaxSize      int64
-	MaxAge       time.Duration
-	MaxBackups   int
+	EnableColors bool
 }
-
-var (
-	// Default logger instance
-	defaultLogger *Logger
-	// Global mutex for thread safety
-	globalMutex sync.RWMutex
-)
 
 // DefaultConfig returns default logger configuration
 func DefaultConfig() *Config {
 	return &Config{
-		Level:        "INFO",
-		Output:       "console",
-		Format:       "text",
-		EnableColors: true,
+		Level:        "info",
+		Format:       "json",
+		Output:       "stdout",
 		EnableCaller: true,
-		LogDir:       "./logs",
-		Filename:     "chatapp.log",
-		MaxSize:      100 * 1024 * 1024,  // 100MB
-		MaxAge:       7 * 24 * time.Hour, // 7 days
-		MaxBackups:   10,
+		EnableColors: false,
 	}
 }
 
-// Init initializes the global logger with default configuration
+// Init initializes the logger with default configuration
 func Init() {
 	config := DefaultConfig()
 	InitWithConfig(config)
 }
 
-// InitWithConfig initializes the global logger with custom configuration
+// InitWithConfig initializes the logger with custom configuration
 func InitWithConfig(config *Config) {
-	logger, err := NewLogger(config)
+	logger := logrus.New()
+
+	// Set log level
+	level, err := logrus.ParseLevel(config.Level)
 	if err != nil {
-		log.Fatalf("Failed to initialize logger: %v", err)
+		level = logrus.InfoLevel
+		log.Printf("Invalid log level '%s', using 'info'", config.Level)
+	}
+	logger.SetLevel(level)
+
+	// Set output
+	var output io.Writer
+	switch config.Output {
+	case "stdout":
+		output = os.Stdout
+	case "stderr":
+		output = os.Stderr
+	default:
+		if config.Output != "" {
+			file, err := os.OpenFile(config.Output, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+			if err != nil {
+				log.Printf("Failed to open log file '%s': %v", config.Output, err)
+				output = os.Stdout
+			} else {
+				output = file
+			}
+		} else {
+			output = os.Stdout
+		}
+	}
+	logger.SetOutput(output)
+
+	// Set formatter
+	if config.Format == "json" {
+		logger.SetFormatter(&logrus.JSONFormatter{
+			TimestampFormat: time.RFC3339,
+		})
+	} else {
+		logger.SetFormatter(&logrus.TextFormatter{
+			FullTimestamp:   true,
+			TimestampFormat: time.RFC3339,
+			ForceColors:     config.EnableColors,
+		})
 	}
 
-	globalMutex.Lock()
-	defaultLogger = logger
-	globalMutex.Unlock()
+	// Enable caller reporting
+	if config.EnableCaller {
+		logger.SetReportCaller(true)
+	}
+
+	appLogger = &Logger{logger}
 
 	Info("Logger initialized successfully")
 }
 
-// NewLogger creates a new logger instance
-func NewLogger(config *Config) (*Logger, error) {
-	level := parseLogLevel(config.Level)
-
-	logger := &Logger{
-		level:        level,
-		enableColors: config.EnableColors && config.Output != "file",
-		enableCaller: config.EnableCaller,
-		enableTime:   true,
-		timeFormat:   "2006-01-02 15:04:05",
-		fields:       make(map[string]interface{}),
-		hooks:        make([]Hook, 0),
-	}
-
-	// Set output
-	switch config.Output {
-	case "console":
-		logger.output = os.Stdout
-	case "file":
-		if err := logger.setupFileOutput(config); err != nil {
-			return nil, fmt.Errorf("failed to setup file output: %w", err)
-		}
-	case "both":
-		logger.output = os.Stdout
-		if err := logger.setupFileOutput(config); err != nil {
-			return nil, fmt.Errorf("failed to setup file output: %w", err)
-		}
-	default:
-		logger.output = os.Stdout
-	}
-
-	return logger, nil
-}
-
-// setupFileOutput configures file output for the logger
-func (l *Logger) setupFileOutput(config *Config) error {
-	// Create log directory if it doesn't exist
-	if err := os.MkdirAll(config.LogDir, 0755); err != nil {
-		return fmt.Errorf("failed to create log directory: %w", err)
-	}
-
-	// Setup rotation config
-	l.rotateConfig = &RotateConfig{
-		MaxSize:    config.MaxSize,
-		MaxAge:     config.MaxAge,
-		MaxBackups: config.MaxBackups,
-		LogDir:     config.LogDir,
-		Filename:   config.Filename,
-	}
-
-	// Open log file
-	logPath := filepath.Join(config.LogDir, config.Filename)
-	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-	if err != nil {
-		return fmt.Errorf("failed to open log file: %w", err)
-	}
-
-	l.currentLogFile = file
-	l.fileOutput = file
-
-	return nil
-}
-
-// parseLogLevel converts string to LogLevel
-func parseLogLevel(level string) LogLevel {
-	switch strings.ToUpper(level) {
-	case "DEBUG":
-		return DEBUG
-	case "INFO":
-		return INFO
-	case "WARN", "WARNING":
-		return WARN
-	case "ERROR":
-		return ERROR
-	case "FATAL":
-		return FATAL
-	default:
-		return INFO
-	}
-}
-
-// log writes a log message with the specified level
-func (l *Logger) log(level LogLevel, args ...interface{}) {
-	if level < l.level {
-		return
-	}
-
-	l.mutex.Lock()
-	defer l.mutex.Unlock()
-
-	message := fmt.Sprint(args...)
-	entry := l.formatLogEntry(level, message)
-
-	// Write to console output
-	if l.output != nil {
-		l.output.Write([]byte(entry))
-	}
-
-	// Write to file output
-	if l.fileOutput != nil {
-		// Remove colors for file output
-		cleanEntry := l.removeColors(entry)
-		l.fileOutput.Write([]byte(cleanEntry))
-
-		// Check if rotation is needed
-		if l.rotateConfig != nil {
-			l.checkRotation()
-		}
-	}
-
-	// Execute hooks
-	for _, hook := range l.hooks {
-		go hook(level, message, l.fields)
-	}
-}
-
-// logf writes a formatted log message with the specified level
-func (l *Logger) logf(level LogLevel, format string, args ...interface{}) {
-	if level < l.level {
-		return
-	}
-
-	l.mutex.Lock()
-	defer l.mutex.Unlock()
-
-	message := fmt.Sprintf(format, args...)
-	entry := l.formatLogEntry(level, message)
-
-	// Write to console output
-	if l.output != nil {
-		l.output.Write([]byte(entry))
-	}
-
-	// Write to file output
-	if l.fileOutput != nil {
-		cleanEntry := l.removeColors(entry)
-		l.fileOutput.Write([]byte(cleanEntry))
-
-		if l.rotateConfig != nil {
-			l.checkRotation()
-		}
-	}
-
-	// Execute hooks
-	for _, hook := range l.hooks {
-		go hook(level, message, l.fields)
-	}
-}
-
-// formatLogEntry formats a log entry
-func (l *Logger) formatLogEntry(level LogLevel, message string) string {
-	var parts []string
-
-	// Add timestamp
-	if l.enableTime {
-		timestamp := time.Now().Format(l.timeFormat)
-		parts = append(parts, timestamp)
-	}
-
-	// Add log level with color
-	levelStr := level.String()
-	if l.enableColors {
-		if color, ok := levelColors[level]; ok {
-			levelStr = color + levelStr + colorReset
-		}
-	}
-	parts = append(parts, fmt.Sprintf("[%s]", levelStr))
-
-	// Add caller information
-	if l.enableCaller {
-		if caller := l.getCaller(); caller != "" {
-			parts = append(parts, caller)
-		}
-	}
-
-	// Add prefix if set
-	if l.prefix != "" {
-		parts = append(parts, l.prefix)
-	}
-
-	// Add fields
-	if len(l.fields) > 0 {
-		fieldsStr := l.formatFields()
-		parts = append(parts, fieldsStr)
-	}
-
-	// Add message
-	parts = append(parts, message)
-
-	return strings.Join(parts, " ") + "\n"
-}
-
-// getCaller returns caller information
-func (l *Logger) getCaller() string {
-	_, file, line, ok := runtime.Caller(4) // Adjust depth as needed
-	if !ok {
-		return ""
-	}
-
-	// Get only the filename, not the full path
-	filename := filepath.Base(file)
-	return fmt.Sprintf("%s:%d", filename, line)
-}
-
-// formatFields formats logger fields
-func (l *Logger) formatFields() string {
-	if len(l.fields) == 0 {
-		return ""
-	}
-
-	var parts []string
-	for key, value := range l.fields {
-		parts = append(parts, fmt.Sprintf("%s=%v", key, value))
-	}
-
-	return "[" + strings.Join(parts, " ") + "]"
-}
-
-// removeColors removes ANSI color codes from text
-func (l *Logger) removeColors(text string) string {
-	for _, color := range levelColors {
-		text = strings.ReplaceAll(text, color, "")
-	}
-	text = strings.ReplaceAll(text, colorReset, "")
-	return text
-}
-
-// checkRotation checks if log rotation is needed
-func (l *Logger) checkRotation() {
-	if l.currentLogFile == nil || l.rotateConfig == nil {
-		return
-	}
-
-	info, err := l.currentLogFile.Stat()
-	if err != nil {
-		return
-	}
-
-	// Check size-based rotation
-	if info.Size() >= l.rotateConfig.MaxSize {
-		l.rotateLog()
-		return
-	}
-
-	// Check age-based rotation
-	if time.Since(info.ModTime()) >= l.rotateConfig.MaxAge {
-		l.rotateLog()
-		return
-	}
-}
-
-// rotateLog performs log rotation
-func (l *Logger) rotateLog() {
-	if l.currentLogFile == nil || l.rotateConfig == nil {
-		return
-	}
-
-	// Close current file
-	l.currentLogFile.Close()
-
-	// Create timestamp for backup file
-	timestamp := time.Now().Format("2006-01-02_15-04-05")
-	backupPath := filepath.Join(
-		l.rotateConfig.LogDir,
-		fmt.Sprintf("%s.%s", l.rotateConfig.Filename, timestamp),
-	)
-
-	// Rename current log file
-	currentPath := filepath.Join(l.rotateConfig.LogDir, l.rotateConfig.Filename)
-	if err := os.Rename(currentPath, backupPath); err != nil {
-		log.Printf("Failed to rotate log file: %v", err)
-		return
-	}
-
-	// Create new log file
-	file, err := os.OpenFile(currentPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-	if err != nil {
-		log.Printf("Failed to create new log file: %v", err)
-		return
-	}
-
-	l.currentLogFile = file
-	l.fileOutput = file
-
-	// Clean up old backup files
-	go l.cleanupBackups()
-}
-
-// cleanupBackups removes old backup files
-func (l *Logger) cleanupBackups() {
-	if l.rotateConfig == nil {
-		return
-	}
-
-	pattern := filepath.Join(l.rotateConfig.LogDir, l.rotateConfig.Filename+".*")
-	matches, err := filepath.Glob(pattern)
-	if err != nil {
-		return
-	}
-
-	if len(matches) <= l.rotateConfig.MaxBackups {
-		return
-	}
-
-	// Sort by modification time and remove oldest files
-	type fileInfo struct {
-		path    string
-		modTime time.Time
-	}
-
-	var files []fileInfo
-	for _, match := range matches {
-		info, err := os.Stat(match)
-		if err != nil {
-			continue
-		}
-		files = append(files, fileInfo{
-			path:    match,
-			modTime: info.ModTime(),
-		})
-	}
-
-	// Sort by modification time (oldest first)
-	for i := 0; i < len(files)-1; i++ {
-		for j := i + 1; j < len(files); j++ {
-			if files[i].modTime.After(files[j].modTime) {
-				files[i], files[j] = files[j], files[i]
-			}
-		}
-	}
-
-	// Remove oldest files
-	toRemove := len(files) - l.rotateConfig.MaxBackups
-	for i := 0; i < toRemove; i++ {
-		os.Remove(files[i].path)
-	}
-}
-
-// Logger methods
-
-// Debug logs a message at DEBUG level
-func (l *Logger) Debug(args ...interface{}) {
-	l.log(DEBUG, args...)
-}
-
-// Debugf logs a formatted message at DEBUG level
-func (l *Logger) Debugf(format string, args ...interface{}) {
-	l.logf(DEBUG, format, args...)
-}
-
-// Info logs a message at INFO level
-func (l *Logger) Info(args ...interface{}) {
-	l.log(INFO, args...)
-}
-
-// Infof logs a formatted message at INFO level
-func (l *Logger) Infof(format string, args ...interface{}) {
-	l.logf(INFO, format, args...)
-}
-
-// Warn logs a message at WARN level
-func (l *Logger) Warn(args ...interface{}) {
-	l.log(WARN, args...)
-}
-
-// Warnf logs a formatted message at WARN level
-func (l *Logger) Warnf(format string, args ...interface{}) {
-	l.logf(WARN, format, args...)
-}
-
-// Error logs a message at ERROR level
-func (l *Logger) Error(args ...interface{}) {
-	l.log(ERROR, args...)
-}
-
-// Errorf logs a formatted message at ERROR level
-func (l *Logger) Errorf(format string, args ...interface{}) {
-	l.logf(ERROR, format, args...)
-}
-
-// Fatal logs a message at FATAL level and exits
-func (l *Logger) Fatal(args ...interface{}) {
-	l.log(FATAL, args...)
-	os.Exit(1)
-}
-
-// Fatalf logs a formatted message at FATAL level and exits
-func (l *Logger) Fatalf(format string, args ...interface{}) {
-	l.logf(FATAL, format, args...)
-	os.Exit(1)
-}
-
-// WithField adds a field to the logger
-func (l *Logger) WithField(key string, value interface{}) *Logger {
-	newLogger := *l
-	newLogger.fields = make(map[string]interface{})
-	for k, v := range l.fields {
-		newLogger.fields[k] = v
-	}
-	newLogger.fields[key] = value
-	return &newLogger
-}
-
-// WithFields adds multiple fields to the logger
-func (l *Logger) WithFields(fields map[string]interface{}) *Logger {
-	newLogger := *l
-	newLogger.fields = make(map[string]interface{})
-	for k, v := range l.fields {
-		newLogger.fields[k] = v
-	}
-	for k, v := range fields {
-		newLogger.fields[k] = v
-	}
-	return &newLogger
-}
-
-// SetLevel sets the minimum log level
-func (l *Logger) SetLevel(level LogLevel) {
-	l.mutex.Lock()
-	defer l.mutex.Unlock()
-	l.level = level
-}
-
-// SetPrefix sets a prefix for all log messages
-func (l *Logger) SetPrefix(prefix string) {
-	l.mutex.Lock()
-	defer l.mutex.Unlock()
-	l.prefix = prefix
-}
-
-// AddHook adds a hook function
-func (l *Logger) AddHook(hook Hook) {
-	l.mutex.Lock()
-	defer l.mutex.Unlock()
-	l.hooks = append(l.hooks, hook)
-}
-
-// Close closes the logger and any open files
-func (l *Logger) Close() error {
-	l.mutex.Lock()
-	defer l.mutex.Unlock()
-
-	if l.currentLogFile != nil {
-		return l.currentLogFile.Close()
-	}
-	return nil
-}
-
-// Global logger functions
-
 // GetLogger returns the global logger instance
 func GetLogger() *Logger {
-	globalMutex.RLock()
-	defer globalMutex.RUnlock()
-	return defaultLogger
-}
-
-// Debug logs a message at DEBUG level using the global logger
-func Debug(args ...interface{}) {
-	if defaultLogger != nil {
-		defaultLogger.Debug(args...)
+	if appLogger == nil {
+		Init() // Initialize with default config if not already initialized
 	}
+	return appLogger
 }
 
-// Debugf logs a formatted message at DEBUG level using the global logger
-func Debugf(format string, args ...interface{}) {
-	if defaultLogger != nil {
-		defaultLogger.Debugf(format, args...)
-	}
-}
-
-// Info logs a message at INFO level using the global logger
-func Info(args ...interface{}) {
-	if defaultLogger != nil {
-		defaultLogger.Info(args...)
-	}
-}
-
-// Infof logs a formatted message at INFO level using the global logger
-func Infof(format string, args ...interface{}) {
-	if defaultLogger != nil {
-		defaultLogger.Infof(format, args...)
-	}
-}
-
-// Warn logs a message at WARN level using the global logger
-func Warn(args ...interface{}) {
-	if defaultLogger != nil {
-		defaultLogger.Warn(args...)
-	}
-}
-
-// Warnf logs a formatted message at WARN level using the global logger
-func Warnf(format string, args ...interface{}) {
-	if defaultLogger != nil {
-		defaultLogger.Warnf(format, args...)
-	}
-}
-
-// Error logs a message at ERROR level using the global logger
-func Error(args ...interface{}) {
-	if defaultLogger != nil {
-		defaultLogger.Error(args...)
-	}
-}
-
-// Errorf logs a formatted message at ERROR level using the global logger
-func Errorf(format string, args ...interface{}) {
-	if defaultLogger != nil {
-		defaultLogger.Errorf(format, args...)
-	}
-}
-
-// Fatal logs a message at FATAL level using the global logger and exits
-func Fatal(args ...interface{}) {
-	if defaultLogger != nil {
-		defaultLogger.Fatal(args...)
-	}
-	os.Exit(1)
-}
-
-// Fatalf logs a formatted message at FATAL level using the global logger and exits
-func Fatalf(format string, args ...interface{}) {
-	if defaultLogger != nil {
-		defaultLogger.Fatalf(format, args...)
-	}
-	os.Exit(1)
-}
-
-// WithField returns a logger with the specified field
-func WithField(key string, value interface{}) *Logger {
-	if defaultLogger != nil {
-		return defaultLogger.WithField(key, value)
-	}
-	return nil
-}
-
-// WithFields returns a logger with the specified fields
-func WithFields(fields map[string]interface{}) *Logger {
-	if defaultLogger != nil {
-		return defaultLogger.WithFields(fields)
-	}
-	return nil
-}
-
-// SetLevel sets the global logger level
+// SetLevel sets the logging level
 func SetLevel(level string) {
-	if defaultLogger != nil {
-		defaultLogger.SetLevel(parseLogLevel(level))
+	if appLogger == nil {
+		Init()
 	}
+
+	logLevel, err := logrus.ParseLevel(level)
+	if err != nil {
+		Errorf("Invalid log level '%s': %v", level, err)
+		return
+	}
+
+	appLogger.SetLevel(logLevel)
+	Infof("Log level set to %s", level)
 }
 
-// Chat Application Specific Logging Helpers
+// WithFields creates a logger entry with fields
+func WithFields(fields Fields) *logrus.Entry {
+	if appLogger == nil {
+		Init()
+	}
+	return appLogger.WithFields(logrus.Fields(fields))
+}
 
-// LogUserAction logs user actions for audit purposes
-func LogUserAction(userID, action, resource string, metadata map[string]interface{}) {
-	fields := map[string]interface{}{
+// WithField creates a logger entry with a single field
+func WithField(key string, value interface{}) *logrus.Entry {
+	if appLogger == nil {
+		Init()
+	}
+	return appLogger.WithField(key, value)
+}
+
+// Logging methods
+
+// Debug logs a debug message
+func Debug(args ...interface{}) {
+	if appLogger == nil {
+		Init()
+	}
+	appLogger.Debug(args...)
+}
+
+// Debugf logs a formatted debug message
+func Debugf(format string, args ...interface{}) {
+	if appLogger == nil {
+		Init()
+	}
+	appLogger.Debugf(format, args...)
+}
+
+// Info logs an info message
+func Info(args ...interface{}) {
+	if appLogger == nil {
+		Init()
+	}
+	appLogger.Info(args...)
+}
+
+// Infof logs a formatted info message
+func Infof(format string, args ...interface{}) {
+	if appLogger == nil {
+		Init()
+	}
+	appLogger.Infof(format, args...)
+}
+
+// Warn logs a warning message
+func Warn(args ...interface{}) {
+	if appLogger == nil {
+		Init()
+	}
+	appLogger.Warn(args...)
+}
+
+// Warnf logs a formatted warning message
+func Warnf(format string, args ...interface{}) {
+	if appLogger == nil {
+		Init()
+	}
+	appLogger.Warnf(format, args...)
+}
+
+// Error logs an error message
+func Error(args ...interface{}) {
+	if appLogger == nil {
+		Init()
+	}
+	appLogger.Error(args...)
+}
+
+// Errorf logs a formatted error message
+func Errorf(format string, args ...interface{}) {
+	if appLogger == nil {
+		Init()
+	}
+	appLogger.Errorf(format, args...)
+}
+
+// Fatal logs a fatal message and exits
+func Fatal(args ...interface{}) {
+	if appLogger == nil {
+		Init()
+	}
+	appLogger.Fatal(args...)
+}
+
+// Fatalf logs a formatted fatal message and exits
+func Fatalf(format string, args ...interface{}) {
+	if appLogger == nil {
+		Init()
+	}
+	appLogger.Fatalf(format, args...)
+}
+
+// Panic logs a panic message and panics
+func Panic(args ...interface{}) {
+	if appLogger == nil {
+		Init()
+	}
+	appLogger.Panic(args...)
+}
+
+// Panicf logs a formatted panic message and panics
+func Panicf(format string, args ...interface{}) {
+	if appLogger == nil {
+		Init()
+	}
+	appLogger.Panicf(format, args...)
+}
+
+// Specialized logging methods
+
+// LogHTTPRequest logs HTTP request details
+func LogHTTPRequest(method, path, userAgent, ip string, statusCode int, duration time.Duration) {
+	WithFields(Fields{
+		"method":      method,
+		"path":        path,
+		"user_agent":  userAgent,
+		"ip":          ip,
+		"status_code": statusCode,
+		"duration_ms": duration.Milliseconds(),
+		"type":        "http_request",
+	}).Info("HTTP request processed")
+}
+
+// LogUserAction logs user actions for audit
+func LogUserAction(userID, action, resource string, metadata Fields) {
+	fields := Fields{
 		"user_id":  userID,
 		"action":   action,
 		"resource": resource,
 		"type":     "user_action",
 	}
 
+	// Merge metadata
 	for k, v := range metadata {
 		fields[k] = v
 	}
 
-	WithFields(fields).Info("User action performed")
+	WithFields(fields).Info("User action logged")
 }
 
-// LogAPIRequest logs API requests
-func LogAPIRequest(method, path, userID, ip string, duration time.Duration, statusCode int) {
-	fields := map[string]interface{}{
-		"method":      method,
-		"path":        path,
-		"user_id":     userID,
-		"ip":          ip,
-		"duration_ms": duration.Milliseconds(),
-		"status_code": statusCode,
-		"type":        "api_request",
+// LogSecurityEvent logs security-related events
+func LogSecurityEvent(event, userID, ip string, details Fields) {
+	fields := Fields{
+		"event":   event,
+		"user_id": userID,
+		"ip":      ip,
+		"type":    "security_event",
 	}
 
-	if statusCode >= 400 {
-		WithFields(fields).Error("API request failed")
-	} else {
-		WithFields(fields).Info("API request completed")
+	// Merge details
+	for k, v := range details {
+		fields[k] = v
 	}
+
+	WithFields(fields).Warn("Security event detected")
+}
+
+// LogSystemEvent logs system events
+func LogSystemEvent(event, component string, details Fields) {
+	fields := Fields{
+		"event":     event,
+		"component": component,
+		"type":      "system_event",
+	}
+
+	// Merge details
+	for k, v := range details {
+		fields[k] = v
+	}
+
+	WithFields(fields).Info("System event logged")
 }
 
 // LogDatabaseOperation logs database operations
 func LogDatabaseOperation(operation, collection string, duration time.Duration, err error) {
-	fields := map[string]interface{}{
+	fields := Fields{
 		"operation":   operation,
 		"collection":  collection,
 		"duration_ms": duration.Milliseconds(),
@@ -745,72 +326,318 @@ func LogDatabaseOperation(operation, collection string, duration time.Duration, 
 	}
 }
 
-// LogSecurityEvent logs security-related events
-func LogSecurityEvent(event, userID, ip string, metadata map[string]interface{}) {
-	fields := map[string]interface{}{
+// LogWebSocketEvent logs WebSocket events
+func LogWebSocketEvent(event, userID, connectionID string, details Fields) {
+	fields := Fields{
+		"event":         event,
+		"user_id":       userID,
+		"connection_id": connectionID,
+		"type":          "websocket_event",
+	}
+
+	// Merge details
+	for k, v := range details {
+		fields[k] = v
+	}
+
+	WithFields(fields).Debug("WebSocket event logged")
+}
+
+// LogWebRTCEvent logs WebRTC events
+func LogWebRTCEvent(event, callID, userID string, details Fields) {
+	fields := Fields{
 		"event":   event,
+		"call_id": callID,
 		"user_id": userID,
-		"ip":      ip,
-		"type":    "security_event",
+		"type":    "webrtc_event",
 	}
 
-	for k, v := range metadata {
+	// Merge details
+	for k, v := range details {
 		fields[k] = v
 	}
 
-	WithFields(fields).Warn("Security event detected")
+	WithFields(fields).Info("WebRTC event logged")
 }
 
-// LogCallEvent logs call-related events
-func LogCallEvent(callID, event, userID string, participants []string, metadata map[string]interface{}) {
-	fields := map[string]interface{}{
-		"call_id":      callID,
-		"event":        event,
-		"user_id":      userID,
-		"participants": participants,
-		"type":         "call_event",
+// LogAPICall logs API calls
+func LogAPICall(method, endpoint, userID string, requestSize, responseSize int64, duration time.Duration, statusCode int) {
+	fields := Fields{
+		"method":        method,
+		"endpoint":      endpoint,
+		"user_id":       userID,
+		"request_size":  requestSize,
+		"response_size": responseSize,
+		"duration_ms":   duration.Milliseconds(),
+		"status_code":   statusCode,
+		"type":          "api_call",
 	}
 
-	for k, v := range metadata {
-		fields[k] = v
+	level := logrus.InfoLevel
+	if statusCode >= 400 {
+		level = logrus.ErrorLevel
+	} else if statusCode >= 300 {
+		level = logrus.WarnLevel
 	}
 
-	WithFields(fields).Info("Call event")
+	appLogger.WithFields(logrus.Fields(fields)).Log(level, "API call processed")
 }
 
-// Performance monitoring
-
-// LogPerformanceMetric logs performance metrics
-func LogPerformanceMetric(metric string, value float64, unit string, tags map[string]string) {
-	fields := map[string]interface{}{
-		"metric": metric,
-		"value":  value,
-		"unit":   unit,
-		"type":   "performance_metric",
+// LogFileOperation logs file operations
+func LogFileOperation(operation, filename, userID string, fileSize int64, err error) {
+	fields := Fields{
+		"operation": operation,
+		"filename":  filename,
+		"user_id":   userID,
+		"file_size": fileSize,
+		"type":      "file_operation",
 	}
 
-	for k, v := range tags {
-		fields[k] = v
-	}
-
-	WithFields(fields).Debug("Performance metric")
-}
-
-// LogSystemHealth logs system health information
-func LogSystemHealth(component string, status string, metadata map[string]interface{}) {
-	fields := map[string]interface{}{
-		"component": component,
-		"status":    status,
-		"type":      "system_health",
-	}
-
-	for k, v := range metadata {
-		fields[k] = v
-	}
-
-	if status == "healthy" {
-		WithFields(fields).Debug("System component healthy")
+	if err != nil {
+		fields["error"] = err.Error()
+		WithFields(fields).Error("File operation failed")
 	} else {
-		WithFields(fields).Warn("System component unhealthy")
+		WithFields(fields).Info("File operation completed")
+	}
+}
+
+// LogPushNotification logs push notification events
+func LogPushNotification(provider, userID, deviceToken string, success bool, err error) {
+	fields := Fields{
+		"provider":     provider,
+		"user_id":      userID,
+		"device_token": maskToken(deviceToken),
+		"success":      success,
+		"type":         "push_notification",
+	}
+
+	if err != nil {
+		fields["error"] = err.Error()
+		WithFields(fields).Error("Push notification failed")
+	} else {
+		WithFields(fields).Info("Push notification sent")
+	}
+}
+
+// LogSMSOperation logs SMS operations
+func LogSMSOperation(provider, phoneNumber string, success bool, err error) {
+	fields := Fields{
+		"provider":     provider,
+		"phone_number": maskPhoneNumber(phoneNumber),
+		"success":      success,
+		"type":         "sms_operation",
+	}
+
+	if err != nil {
+		fields["error"] = err.Error()
+		WithFields(fields).Error("SMS operation failed")
+	} else {
+		WithFields(fields).Info("SMS sent successfully")
+	}
+}
+
+// LogEmailOperation logs email operations
+func LogEmailOperation(provider, recipient string, subject string, success bool, err error) {
+	fields := Fields{
+		"provider":  provider,
+		"recipient": maskEmail(recipient),
+		"subject":   subject,
+		"success":   success,
+		"type":      "email_operation",
+	}
+
+	if err != nil {
+		fields["error"] = err.Error()
+		WithFields(fields).Error("Email operation failed")
+	} else {
+		WithFields(fields).Info("Email sent successfully")
+	}
+}
+
+// Performance logging
+
+// LogPerformance logs performance metrics
+func LogPerformance(operation string, duration time.Duration, metadata Fields) {
+	fields := Fields{
+		"operation":   operation,
+		"duration_ms": duration.Milliseconds(),
+		"type":        "performance",
+	}
+
+	// Merge metadata
+	for k, v := range metadata {
+		fields[k] = v
+	}
+
+	level := logrus.InfoLevel
+	if duration > 5*time.Second {
+		level = logrus.WarnLevel
+	} else if duration > 10*time.Second {
+		level = logrus.ErrorLevel
+	}
+
+	appLogger.WithFields(logrus.Fields(fields)).Log(level, "Performance metric logged")
+}
+
+// LogMemoryUsage logs memory usage
+func LogMemoryUsage() {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+
+	WithFields(Fields{
+		"alloc_mb":       bToMb(m.Alloc),
+		"total_alloc_mb": bToMb(m.TotalAlloc),
+		"sys_mb":         bToMb(m.Sys),
+		"num_gc":         m.NumGC,
+		"type":           "memory_usage",
+	}).Debug("Memory usage logged")
+}
+
+// LogGoroutineCount logs current goroutine count
+func LogGoroutineCount() {
+	count := runtime.NumGoroutine()
+	WithFields(Fields{
+		"goroutine_count": count,
+		"type":            "goroutine_count",
+	}).Debug("Goroutine count logged")
+}
+
+// Utility functions
+
+// maskToken masks sensitive token for logging
+func maskToken(token string) string {
+	if len(token) <= 8 {
+		return "***"
+	}
+	return token[:4] + "***" + token[len(token)-4:]
+}
+
+// maskPhoneNumber masks phone number for logging
+func maskPhoneNumber(phone string) string {
+	if len(phone) <= 4 {
+		return "***"
+	}
+	return phone[:2] + "***" + phone[len(phone)-2:]
+}
+
+// maskEmail masks email for logging
+func maskEmail(email string) string {
+	parts := strings.Split(email, "@")
+	if len(parts) != 2 {
+		return "***"
+	}
+
+	username := parts[0]
+	domain := parts[1]
+
+	if len(username) <= 2 {
+		return "***@" + domain
+	}
+
+	return username[:1] + "***" + username[len(username)-1:] + "@" + domain
+}
+
+// bToMb converts bytes to megabytes
+func bToMb(b uint64) uint64 {
+	return b / 1024 / 1024
+}
+
+// Context-aware logging
+
+// RequestLogger creates a logger with request context
+func RequestLogger(requestID, userID, ip string) *logrus.Entry {
+	return WithFields(Fields{
+		"request_id": requestID,
+		"user_id":    userID,
+		"ip":         ip,
+	})
+}
+
+// ErrorWithStack logs error with stack trace
+func ErrorWithStack(err error, message string) {
+	if appLogger == nil {
+		Init()
+	}
+
+	stack := make([]byte, 4096)
+	length := runtime.Stack(stack, false)
+
+	WithFields(Fields{
+		"error": err.Error(),
+		"stack": string(stack[:length]),
+		"type":  "error_with_stack",
+	}).Error(message)
+}
+
+// LogStartup logs application startup information
+func LogStartup(appName, version, environment string, port int) {
+	WithFields(Fields{
+		"app_name":    appName,
+		"version":     version,
+		"environment": environment,
+		"port":        port,
+		"type":        "startup",
+	}).Info("Application started")
+}
+
+// LogShutdown logs application shutdown
+func LogShutdown(reason string) {
+	WithFields(Fields{
+		"reason": reason,
+		"type":   "shutdown",
+	}).Info("Application shutting down")
+}
+
+// Configuration helpers
+
+// SetJSONFormat sets JSON formatter
+func SetJSONFormat() {
+	if appLogger == nil {
+		Init()
+	}
+	appLogger.SetFormatter(&logrus.JSONFormatter{
+		TimestampFormat: time.RFC3339,
+	})
+}
+
+// SetTextFormat sets text formatter
+func SetTextFormat(colors bool) {
+	if appLogger == nil {
+		Init()
+	}
+	appLogger.SetFormatter(&logrus.TextFormatter{
+		FullTimestamp:   true,
+		TimestampFormat: time.RFC3339,
+		ForceColors:     colors,
+	})
+}
+
+// SetOutput sets logger output
+func SetOutput(output io.Writer) {
+	if appLogger == nil {
+		Init()
+	}
+	appLogger.SetOutput(output)
+}
+
+// GetLevel returns current log level
+func GetLevel() logrus.Level {
+	if appLogger == nil {
+		Init()
+	}
+	return appLogger.GetLevel()
+}
+
+// IsDebugEnabled returns true if debug logging is enabled
+func IsDebugEnabled() bool {
+	return GetLevel() >= logrus.DebugLevel
+}
+
+// Close closes the logger (if logging to file)
+func Close() {
+	if appLogger != nil {
+		Info("Logger shutting down")
+		// If we were logging to a file, we could close it here
+		// For now, just log the shutdown
 	}
 }

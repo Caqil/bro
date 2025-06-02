@@ -1,6 +1,7 @@
 package services
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -10,156 +11,74 @@ import (
 
 	"bro/internal/config"
 	"bro/pkg/logger"
-	"bro/pkg/redis"
 )
 
 // SMSService handles SMS operations
 type SMSService struct {
-	config      *config.Config
-	redisClient *redis.Client
-	httpClient  *http.Client
-	provider    SMSProvider
+	config   *config.Config
+	provider SMSProvider
 }
 
 // SMSProvider interface for different SMS providers
 type SMSProvider interface {
-	SendSMS(to, message string) (*SMSResponse, error)
-	GetDeliveryStatus(messageID string) (*DeliveryStatus, error)
+	SendSMS(phoneNumber, message string) error
 	GetProviderName() string
 }
 
-// SMSResponse represents SMS sending response
-type SMSResponse struct {
-	MessageID    string                 `json:"message_id"`
-	Status       string                 `json:"status"`
-	Provider     string                 `json:"provider"`
-	To           string                 `json:"to"`
-	Message      string                 `json:"message"`
-	Cost         float64                `json:"cost,omitempty"`
-	Segments     int                    `json:"segments,omitempty"`
-	Timestamp    time.Time              `json:"timestamp"`
-	ProviderData map[string]interface{} `json:"provider_data,omitempty"`
+// SMSResult represents the result of sending an SMS
+type SMSResult struct {
+	Success   bool   `json:"success"`
+	MessageID string `json:"message_id,omitempty"`
+	Error     string `json:"error,omitempty"`
+	Cost      string `json:"cost,omitempty"`
 }
 
-// DeliveryStatus represents SMS delivery status
-type DeliveryStatus struct {
-	MessageID     string    `json:"message_id"`
-	Status        string    `json:"status"` // "pending", "sent", "delivered", "failed", "unknown"
-	DeliveredAt   time.Time `json:"delivered_at,omitempty"`
-	ErrorCode     string    `json:"error_code,omitempty"`
-	ErrorMessage  string    `json:"error_message,omitempty"`
-	Cost          float64   `json:"cost,omitempty"`
-	LastUpdatedAt time.Time `json:"last_updated_at"`
-}
-
-// SMSTemplate represents SMS template
-type SMSTemplate struct {
-	Name      string            `json:"name"`
-	Content   string            `json:"content"`
-	Variables []string          `json:"variables"`
-	Language  string            `json:"language"`
-	IsActive  bool              `json:"is_active"`
-	Metadata  map[string]string `json:"metadata,omitempty"`
-}
-
-// SMSMetrics represents SMS metrics
-type SMSMetrics struct {
-	TotalSent      int64     `json:"total_sent"`
-	TotalDelivered int64     `json:"total_delivered"`
-	TotalFailed    int64     `json:"total_failed"`
-	DeliveryRate   float64   `json:"delivery_rate"`
-	AverageCost    float64   `json:"average_cost"`
-	TotalCost      float64   `json:"total_cost"`
-	LastUpdated    time.Time `json:"last_updated"`
-}
-
-// TwilioProvider implements SMS provider for Twilio
-type TwilioProvider struct {
+// Twilio SMS Provider
+type TwilioSMSProvider struct {
 	config     *config.TwilioConfig
 	httpClient *http.Client
 }
 
-// FirebaseProvider implements SMS provider for Firebase
-type FirebaseProvider struct {
+// Firebase SMS Provider (using Firebase Auth)
+type FirebaseSMSProvider struct {
 	config     *config.FirebaseConfig
 	httpClient *http.Client
 }
 
-// OneSignalProvider implements SMS provider for OneSignal
-type OneSignalProvider struct {
-	config     *config.OneSignalConfig
-	httpClient *http.Client
-}
-
-// Common SMS templates
-var DefaultSMSTemplates = map[string]SMSTemplate{
-	"otp_registration": {
-		Name:      "OTP Registration",
-		Content:   "Your verification code for {app_name} is: {otp}. This code will expire in {expiry_minutes} minutes.",
-		Variables: []string{"app_name", "otp", "expiry_minutes"},
-		Language:  "en",
-		IsActive:  true,
-	},
-	"otp_login": {
-		Name:      "OTP Login",
-		Content:   "Your login code for {app_name} is: {otp}. If you didn't request this, please ignore this message.",
-		Variables: []string{"app_name", "otp"},
-		Language:  "en",
-		IsActive:  true,
-	},
-	"password_reset": {
-		Name:      "Password Reset",
-		Content:   "Your password reset code for {app_name} is: {otp}. This code will expire in {expiry_minutes} minutes.",
-		Variables: []string{"app_name", "otp", "expiry_minutes"},
-		Language:  "en",
-		IsActive:  true,
-	},
-	"welcome": {
-		Name:      "Welcome Message",
-		Content:   "Welcome to {app_name}! Your account has been successfully created. Start connecting with friends now!",
-		Variables: []string{"app_name"},
-		Language:  "en",
-		IsActive:  true,
-	},
-	"security_alert": {
-		Name:      "Security Alert",
-		Content:   "Security Alert: Your {app_name} account was accessed from a new device. If this wasn't you, please secure your account immediately.",
-		Variables: []string{"app_name"},
-		Language:  "en",
-		IsActive:  true,
-	},
-}
+// Mock SMS Provider for testing
+type MockSMSProvider struct{}
 
 // NewSMSService creates a new SMS service
 func NewSMSService(config *config.Config) *SMSService {
-	redisClient := redis.GetClient()
-
 	httpClient := &http.Client{
 		Timeout: 30 * time.Second,
 	}
 
 	service := &SMSService{
-		config:      config,
-		redisClient: redisClient,
-		httpClient:  httpClient,
+		config: config,
 	}
 
 	// Initialize provider based on configuration
 	switch strings.ToLower(config.SMSProvider) {
 	case "twilio":
-		service.provider = &TwilioProvider{
-			config:     &config.TwilioConfig,
-			httpClient: httpClient,
+		if config.TwilioConfig.AccountSID == "" || config.TwilioConfig.AuthToken == "" {
+			logger.Warn("Twilio credentials not configured, using mock SMS provider")
+			service.provider = &MockSMSProvider{}
+		} else {
+			service.provider = &TwilioSMSProvider{
+				config:     &config.TwilioConfig,
+				httpClient: httpClient,
+			}
 		}
 	case "firebase":
-		service.provider = &FirebaseProvider{
-			config:     &config.FirebaseConfig,
-			httpClient: httpClient,
-		}
-	case "onesignal":
-		service.provider = &OneSignalProvider{
-			config:     &config.OneSignalConfig,
-			httpClient: httpClient,
+		if config.FirebaseConfig.ProjectID == "" {
+			logger.Warn("Firebase credentials not configured, using mock SMS provider")
+			service.provider = &MockSMSProvider{}
+		} else {
+			service.provider = &FirebaseSMSProvider{
+				config:     &config.FirebaseConfig,
+				httpClient: httpClient,
+			}
 		}
 	default:
 		logger.Warn("No SMS provider configured, using mock provider")
@@ -170,614 +89,403 @@ func NewSMSService(config *config.Config) *SMSService {
 	return service
 }
 
-// Public SMS Service Methods
+// SendOTP sends OTP SMS to phone number
+func (sms *SMSService) SendOTP(phoneNumber, otp string) error {
+	message := fmt.Sprintf("Your ChatApp verification code is: %s. Do not share this code with anyone.", otp)
 
-// SendOTP sends OTP SMS to user
-func (s *SMSService) SendOTP(phoneNumber, otp, reason string) error {
-	startTime := time.Now()
-
-	// Check rate limiting
-	if err := s.checkRateLimit(phoneNumber); err != nil {
-		return fmt.Errorf("rate limit exceeded: %w", err)
-	}
-
-	// Get appropriate template
-	var templateName string
-	switch reason {
-	case "registration":
-		templateName = "otp_registration"
-	case "login":
-		templateName = "otp_login"
-	case "password_reset":
-		templateName = "password_reset"
-	default:
-		templateName = "otp_registration"
-	}
-
-	// Generate message from template
-	message, err := s.generateMessage(templateName, map[string]string{
-		"app_name":       "ChatApp",
-		"otp":            otp,
-		"expiry_minutes": "10",
-	})
+	err := sms.provider.SendSMS(phoneNumber, message)
 	if err != nil {
-		return fmt.Errorf("failed to generate message: %w", err)
+		logger.LogSMSOperation(sms.provider.GetProviderName(), phoneNumber, false, err)
+		return fmt.Errorf("failed to send OTP SMS: %w", err)
 	}
 
-	// Send SMS
-	response, err := s.provider.SendSMS(phoneNumber, message)
+	logger.LogSMSOperation(sms.provider.GetProviderName(), phoneNumber, true, nil)
+	return nil
+}
+
+// SendWelcomeMessage sends welcome SMS to new users
+func (sms *SMSService) SendWelcomeMessage(phoneNumber, userName string) error {
+	message := fmt.Sprintf("Welcome to ChatApp, %s! Start chatting with friends and family now.", userName)
+
+	err := sms.provider.SendSMS(phoneNumber, message)
 	if err != nil {
-		duration := time.Since(startTime)
-		logger.Errorf("Failed to send OTP SMS to %s: %v (duration: %dms)", phoneNumber, err, duration.Milliseconds())
+		logger.LogSMSOperation(sms.provider.GetProviderName(), phoneNumber, false, err)
+		return fmt.Errorf("failed to send welcome SMS: %w", err)
+	}
 
-		// Log failed SMS
-		s.logSMSEvent("otp_send_failed", phoneNumber, message, map[string]interface{}{
-			"error":       err.Error(),
-			"reason":      reason,
-			"duration_ms": duration.Milliseconds(),
-		})
+	logger.LogSMSOperation(sms.provider.GetProviderName(), phoneNumber, true, nil)
+	return nil
+}
 
+// SendCustomMessage sends a custom SMS message
+func (sms *SMSService) SendCustomMessage(phoneNumber, message string) error {
+	err := sms.provider.SendSMS(phoneNumber, message)
+	if err != nil {
+		logger.LogSMSOperation(sms.provider.GetProviderName(), phoneNumber, false, err)
 		return fmt.Errorf("failed to send SMS: %w", err)
 	}
 
-	// Update rate limiting
-	s.updateRateLimit(phoneNumber)
-
-	// Cache SMS response
-	if s.redisClient != nil {
-		s.cacheSMSResponse(response)
-	}
-
-	// Log successful SMS
-	duration := time.Since(startTime)
-	s.logSMSEvent("otp_sent", phoneNumber, message, map[string]interface{}{
-		"message_id":  response.MessageID,
-		"provider":    response.Provider,
-		"reason":      reason,
-		"duration_ms": duration.Milliseconds(),
-		"cost":        response.Cost,
-		"segments":    response.Segments,
-	})
-
-	logger.Infof("OTP SMS sent successfully to %s (ID: %s, Provider: %s)",
-		phoneNumber, response.MessageID, response.Provider)
-
+	logger.LogSMSOperation(sms.provider.GetProviderName(), phoneNumber, true, nil)
 	return nil
 }
 
-// SendSMS sends a custom SMS message
-func (s *SMSService) SendSMS(phoneNumber, message string, metadata map[string]interface{}) (*SMSResponse, error) {
-	startTime := time.Now()
+// SendBulkSMS sends SMS to multiple phone numbers
+func (sms *SMSService) SendBulkSMS(phoneNumbers []string, message string) error {
+	var errors []string
+	successCount := 0
 
-	// Validate inputs
-	if err := s.validatePhoneNumber(phoneNumber); err != nil {
-		return nil, fmt.Errorf("invalid phone number: %w", err)
-	}
-
-	if err := s.validateMessage(message); err != nil {
-		return nil, fmt.Errorf("invalid message: %w", err)
-	}
-
-	// Check rate limiting
-	if err := s.checkRateLimit(phoneNumber); err != nil {
-		return nil, fmt.Errorf("rate limit exceeded: %w", err)
-	}
-
-	// Send SMS
-	response, err := s.provider.SendSMS(phoneNumber, message)
-	if err != nil {
-		duration := time.Since(startTime)
-		logger.Errorf("Failed to send SMS to %s: %v (duration: %dms)", phoneNumber, err, duration.Milliseconds())
-
-		s.logSMSEvent("sms_send_failed", phoneNumber, message, map[string]interface{}{
-			"error":       err.Error(),
-			"duration_ms": duration.Milliseconds(),
-			"metadata":    metadata,
-		})
-
-		return nil, fmt.Errorf("failed to send SMS: %w", err)
-	}
-
-	// Update rate limiting
-	s.updateRateLimit(phoneNumber)
-
-	// Cache SMS response
-	if s.redisClient != nil {
-		s.cacheSMSResponse(response)
-	}
-
-	// Log successful SMS
-	duration := time.Since(startTime)
-	s.logSMSEvent("sms_sent", phoneNumber, message, map[string]interface{}{
-		"message_id":  response.MessageID,
-		"provider":    response.Provider,
-		"duration_ms": duration.Milliseconds(),
-		"cost":        response.Cost,
-		"segments":    response.Segments,
-		"metadata":    metadata,
-	})
-
-	return response, nil
-}
-
-// SendWelcomeMessage sends welcome message to new user
-func (s *SMSService) SendWelcomeMessage(phoneNumber string) error {
-	message, err := s.generateMessage("welcome", map[string]string{
-		"app_name": "ChatApp",
-	})
-	if err != nil {
-		return fmt.Errorf("failed to generate welcome message: %w", err)
-	}
-
-	_, err = s.SendSMS(phoneNumber, message, map[string]interface{}{
-		"type": "welcome",
-	})
-	return err
-}
-
-// SendSecurityAlert sends security alert SMS
-func (s *SMSService) SendSecurityAlert(phoneNumber, alertType string, details map[string]interface{}) error {
-	message, err := s.generateMessage("security_alert", map[string]string{
-		"app_name": "ChatApp",
-	})
-	if err != nil {
-		return fmt.Errorf("failed to generate security alert: %w", err)
-	}
-
-	metadata := map[string]interface{}{
-		"type":       "security_alert",
-		"alert_type": alertType,
-		"details":    details,
-	}
-
-	_, err = s.SendSMS(phoneNumber, message, metadata)
-	return err
-}
-
-// GetDeliveryStatus gets delivery status for a message
-func (s *SMSService) GetDeliveryStatus(messageID string) (*DeliveryStatus, error) {
-	// Try to get from cache first
-	if s.redisClient != nil {
-		if cached, err := s.getCachedDeliveryStatus(messageID); err == nil && cached != nil {
-			return cached, nil
+	for _, phoneNumber := range phoneNumbers {
+		err := sms.provider.SendSMS(phoneNumber, message)
+		if err != nil {
+			errors = append(errors, fmt.Sprintf("%s: %v", phoneNumber, err))
+			logger.LogSMSOperation(sms.provider.GetProviderName(), phoneNumber, false, err)
+		} else {
+			successCount++
+			logger.LogSMSOperation(sms.provider.GetProviderName(), phoneNumber, true, nil)
 		}
 	}
 
-	// Get from provider
-	status, err := s.provider.GetDeliveryStatus(messageID)
+	if len(errors) > 0 {
+		return fmt.Errorf("failed to send %d/%d SMS messages: %s", len(errors), len(phoneNumbers), strings.Join(errors, "; "))
+	}
+
+	logger.Infof("Successfully sent bulk SMS to %d recipients", successCount)
+	return nil
+}
+
+// SendPasswordResetCode sends password reset code
+func (sms *SMSService) SendPasswordResetCode(phoneNumber, code string) error {
+	message := fmt.Sprintf("Your ChatApp password reset code is: %s. This code will expire in 10 minutes.", code)
+
+	err := sms.provider.SendSMS(phoneNumber, message)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get delivery status: %w", err)
+		logger.LogSMSOperation(sms.provider.GetProviderName(), phoneNumber, false, err)
+		return fmt.Errorf("failed to send password reset SMS: %w", err)
 	}
 
-	// Cache the status
-	if s.redisClient != nil {
-		s.cacheDeliveryStatus(status)
-	}
-
-	return status, nil
+	logger.LogSMSOperation(sms.provider.GetProviderName(), phoneNumber, true, nil)
+	return nil
 }
 
-// GetSMSMetrics gets SMS metrics
-func (s *SMSService) GetSMSMetrics(days int) (*SMSMetrics, error) {
-	if s.redisClient == nil {
-		return &SMSMetrics{}, nil
-	}
+// SendAccountLockedNotification sends account locked notification
+func (sms *SMSService) SendAccountLockedNotification(phoneNumber string) error {
+	message := "Your ChatApp account has been temporarily locked due to suspicious activity. Please contact support if you need assistance."
 
-	// This would typically aggregate data from logs or database
-	// For now, return basic metrics from Redis
-	metrics := &SMSMetrics{
-		LastUpdated: time.Now(),
-	}
-
-	return metrics, nil
-}
-
-// Template Management
-
-// generateMessage generates message from template
-func (s *SMSService) generateMessage(templateName string, variables map[string]string) (string, error) {
-	template, exists := DefaultSMSTemplates[templateName]
-	if !exists {
-		return "", fmt.Errorf("template not found: %s", templateName)
-	}
-
-	if !template.IsActive {
-		return "", fmt.Errorf("template is inactive: %s", templateName)
-	}
-
-	message := template.Content
-
-	// Replace variables
-	for key, value := range variables {
-		placeholder := fmt.Sprintf("{%s}", key)
-		message = strings.ReplaceAll(message, placeholder, value)
-	}
-
-	// Check if all variables were replaced
-	if strings.Contains(message, "{") && strings.Contains(message, "}") {
-		logger.Warnf("Message still contains unreplaced variables: %s", message)
-	}
-
-	return message, nil
-}
-
-// Rate Limiting
-
-// checkRateLimit checks if SMS can be sent to phone number
-func (s *SMSService) checkRateLimit(phoneNumber string) error {
-	if s.redisClient == nil {
-		return nil // Skip rate limiting if Redis is not available
-	}
-
-	key := fmt.Sprintf("sms_rate_limit:%s", phoneNumber)
-
-	// Check rate limit (5 SMS per hour per phone number)
-	allowed, err := s.redisClient.RateLimitCheck(key, 5, 1*time.Hour)
+	err := sms.provider.SendSMS(phoneNumber, message)
 	if err != nil {
-		logger.Error("Failed to check SMS rate limit:", err)
-		return nil // Allow SMS if rate limit check fails
+		logger.LogSMSOperation(sms.provider.GetProviderName(), phoneNumber, false, err)
+		return fmt.Errorf("failed to send account locked SMS: %w", err)
 	}
 
-	if !allowed {
-		return fmt.Errorf("SMS rate limit exceeded for phone number: %s", phoneNumber)
-	}
-
+	logger.LogSMSOperation(sms.provider.GetProviderName(), phoneNumber, true, nil)
 	return nil
 }
 
-// updateRateLimit updates rate limit counter
-func (s *SMSService) updateRateLimit(phoneNumber string) {
-	if s.redisClient == nil {
-		return
-	}
+// Twilio Provider Implementation
 
-	key := fmt.Sprintf("sms_rate_limit:%s", phoneNumber)
-	s.redisClient.IncrementBy(key, 1)
-}
+func (tp *TwilioSMSProvider) SendSMS(phoneNumber, message string) error {
+	// Twilio API endpoint
+	apiURL := fmt.Sprintf("https://api.twilio.com/2010-04-01/Accounts/%s/Messages.json", tp.config.AccountSID)
 
-// Validation
-
-// validatePhoneNumber validates phone number format
-func (s *SMSService) validatePhoneNumber(phoneNumber string) error {
-	if phoneNumber == "" {
-		return fmt.Errorf("phone number is required")
-	}
-
-	// Basic validation - should start with + and contain only digits
-	if !strings.HasPrefix(phoneNumber, "+") {
-		return fmt.Errorf("phone number must start with country code (+)")
-	}
-
-	digits := strings.TrimPrefix(phoneNumber, "+")
-	if len(digits) < 8 || len(digits) > 15 {
-		return fmt.Errorf("invalid phone number length")
-	}
-
-	for _, char := range digits {
-		if char < '0' || char > '9' {
-			return fmt.Errorf("phone number must contain only digits")
-		}
-	}
-
-	return nil
-}
-
-// validateMessage validates SMS message content
-func (s *SMSService) validateMessage(message string) error {
-	if message == "" {
-		return fmt.Errorf("message is required")
-	}
-
-	if len(message) > 1600 { // Maximum for concatenated SMS
-		return fmt.Errorf("message too long (max 1600 characters)")
-	}
-
-	return nil
-}
-
-// Caching
-
-// cacheSMSResponse caches SMS response in Redis
-func (s *SMSService) cacheSMSResponse(response *SMSResponse) {
-	if s.redisClient == nil {
-		return
-	}
-
-	key := fmt.Sprintf("sms_response:%s", response.MessageID)
-	if err := s.redisClient.SetEX(key, response, 24*time.Hour); err != nil {
-		logger.Error("Failed to cache SMS response:", err)
-	}
-}
-
-// cacheDeliveryStatus caches delivery status in Redis
-func (s *SMSService) cacheDeliveryStatus(status *DeliveryStatus) {
-	if s.redisClient == nil {
-		return
-	}
-
-	key := fmt.Sprintf("sms_delivery:%s", status.MessageID)
-	if err := s.redisClient.SetEX(key, status, 1*time.Hour); err != nil {
-		logger.Error("Failed to cache delivery status:", err)
-	}
-}
-
-// getCachedDeliveryStatus gets cached delivery status
-func (s *SMSService) getCachedDeliveryStatus(messageID string) (*DeliveryStatus, error) {
-	key := fmt.Sprintf("sms_delivery:%s", messageID)
-	var status DeliveryStatus
-	if err := s.redisClient.GetJSON(key, &status); err != nil {
-		return nil, err
-	}
-	return &status, nil
-}
-
-// Logging
-
-// logSMSEvent logs SMS-related events
-func (s *SMSService) logSMSEvent(event, phoneNumber, message string, metadata map[string]interface{}) {
-	fields := map[string]interface{}{
-		"event":          event,
-		"phone_number":   phoneNumber,
-		"message_length": len(message),
-		"provider":       s.provider.GetProviderName(),
-		"type":           "sms_event",
-	}
-
-	for k, v := range metadata {
-		fields[k] = v
-	}
-
-	logger.WithFields(fields).Info("SMS event")
-}
-
-// Provider Implementations
-
-// Twilio Provider
-
-func (t *TwilioProvider) SendSMS(to, message string) (*SMSResponse, error) {
-	if t.config.AccountSID == "" || t.config.AuthToken == "" {
-		return nil, fmt.Errorf("Twilio credentials not configured")
-	}
-
-	// Prepare request
-	apiURL := fmt.Sprintf("https://api.twilio.com/2010-04-01/Accounts/%s/Messages.json", t.config.AccountSID)
-
+	// Prepare form data
 	data := url.Values{}
-	data.Set("To", to)
-	data.Set("From", t.config.PhoneNumber)
+	data.Set("To", phoneNumber)
+	data.Set("From", tp.config.PhoneNumber)
 	data.Set("Body", message)
 
+	// Create request
 	req, err := http.NewRequest("POST", apiURL, strings.NewReader(data.Encode()))
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return fmt.Errorf("failed to create Twilio request: %w", err)
 	}
 
-	req.SetBasicAuth(t.config.AccountSID, t.config.AuthToken)
+	// Set headers
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetBasicAuth(tp.config.AccountSID, tp.config.AuthToken)
 
 	// Send request
-	resp, err := t.httpClient.Do(req)
+	resp, err := tp.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
+		return fmt.Errorf("failed to send Twilio SMS: %w", err)
 	}
 	defer resp.Body.Close()
 
-	// Parse response
-	var twilioResp struct {
-		SID          string  `json:"sid"`
-		Status       string  `json:"status"`
-		To           string  `json:"to"`
-		From         string  `json:"from"`
-		Body         string  `json:"body"`
-		NumSegments  string  `json:"num_segments"`
-		Price        string  `json:"price"`
-		ErrorCode    *string `json:"error_code"`
-		ErrorMessage *string `json:"error_message"`
+	// Check response status
+	if resp.StatusCode != http.StatusCreated {
+		return fmt.Errorf("Twilio API returned status code: %d", resp.StatusCode)
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(&twilioResp); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
-	}
-
-	if resp.StatusCode != 201 {
-		errorMsg := "unknown error"
-		if twilioResp.ErrorMessage != nil {
-			errorMsg = *twilioResp.ErrorMessage
-		}
-		return nil, fmt.Errorf("Twilio API error (%d): %s", resp.StatusCode, errorMsg)
-	}
-
-	// Convert segments to int
-	segments := 1
-	if twilioResp.NumSegments != "" {
-		if s, err := fmt.Sscanf(twilioResp.NumSegments, "%d", &segments); err != nil || s != 1 {
-			segments = 1
+	// Parse response for message ID
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		logger.Errorf("Failed to parse Twilio response: %v", err)
+	} else {
+		if sid, ok := result["sid"].(string); ok {
+			logger.Debugf("Twilio SMS sent with SID: %s", sid)
 		}
 	}
 
-	// Convert price to float
-	var cost float64
-	if twilioResp.Price != "" {
-		fmt.Sscanf(twilioResp.Price, "%f", &cost)
-		if cost < 0 {
-			cost = -cost // Convert negative price to positive
-		}
-	}
-
-	response := &SMSResponse{
-		MessageID: twilioResp.SID,
-		Status:    twilioResp.Status,
-		Provider:  "twilio",
-		To:        to,
-		Message:   message,
-		Cost:      cost,
-		Segments:  segments,
-		Timestamp: time.Now(),
-		ProviderData: map[string]interface{}{
-			"from":         twilioResp.From,
-			"raw_response": twilioResp,
-		},
-	}
-
-	return response, nil
+	return nil
 }
 
-func (t *TwilioProvider) GetDeliveryStatus(messageID string) (*DeliveryStatus, error) {
-	if t.config.AccountSID == "" || t.config.AuthToken == "" {
-		return nil, fmt.Errorf("Twilio credentials not configured")
-	}
-
-	apiURL := fmt.Sprintf("https://api.twilio.com/2010-04-01/Accounts/%s/Messages/%s.json",
-		t.config.AccountSID, messageID)
-
-	req, err := http.NewRequest("GET", apiURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	req.SetBasicAuth(t.config.AccountSID, t.config.AuthToken)
-
-	resp, err := t.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	var twilioResp struct {
-		SID          string  `json:"sid"`
-		Status       string  `json:"status"`
-		ErrorCode    *int    `json:"error_code"`
-		ErrorMessage *string `json:"error_message"`
-		DateSent     *string `json:"date_sent"`
-		Price        string  `json:"price"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&twilioResp); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
-	}
-
-	status := &DeliveryStatus{
-		MessageID:     messageID,
-		Status:        mapTwilioStatus(twilioResp.Status),
-		LastUpdatedAt: time.Now(),
-	}
-
-	if twilioResp.ErrorCode != nil {
-		status.ErrorCode = fmt.Sprintf("%d", *twilioResp.ErrorCode)
-	}
-
-	if twilioResp.ErrorMessage != nil {
-		status.ErrorMessage = *twilioResp.ErrorMessage
-	}
-
-	if twilioResp.DateSent != nil && status.Status == "delivered" {
-		if deliveredAt, err := time.Parse(time.RFC3339, *twilioResp.DateSent); err == nil {
-			status.DeliveredAt = deliveredAt
-		}
-	}
-
-	if twilioResp.Price != "" {
-		fmt.Sscanf(twilioResp.Price, "%f", &status.Cost)
-		if status.Cost < 0 {
-			status.Cost = -status.Cost
-		}
-	}
-
-	return status, nil
-}
-
-func (t *TwilioProvider) GetProviderName() string {
+func (tp *TwilioSMSProvider) GetProviderName() string {
 	return "twilio"
 }
 
-// Firebase Provider (placeholder implementation)
+// Firebase Provider Implementation
 
-func (f *FirebaseProvider) SendSMS(to, message string) (*SMSResponse, error) {
-	// Firebase doesn't have a direct SMS service, this would integrate with Firebase Auth
-	// or use Firebase Functions with a third-party SMS provider
-	return nil, fmt.Errorf("Firebase SMS not implemented yet")
+func (fp *FirebaseSMSProvider) SendSMS(phoneNumber, message string) error {
+	// Firebase doesn't have direct SMS API like Twilio
+	// This is a placeholder implementation
+	// In reality, you might use Firebase Functions with a third-party SMS service
+
+	apiURL := fmt.Sprintf("https://%s.cloudfunctions.net/sendSMS", fp.config.ProjectID)
+
+	// Prepare JSON payload
+	payload := map[string]string{
+		"phoneNumber": phoneNumber,
+		"message":     message,
+	}
+
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal Firebase SMS payload: %w", err)
+	}
+
+	// Create request
+	req, err := http.NewRequest("POST", apiURL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return fmt.Errorf("failed to create Firebase request: %w", err)
+	}
+
+	// Set headers
+	req.Header.Set("Content-Type", "application/json")
+	// Add Firebase authentication if needed
+	// req.Header.Set("Authorization", "Bearer " + accessToken)
+
+	// Send request
+	resp, err := fp.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send Firebase SMS: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Check response status
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("Firebase SMS API returned status code: %d", resp.StatusCode)
+	}
+
+	return nil
 }
 
-func (f *FirebaseProvider) GetDeliveryStatus(messageID string) (*DeliveryStatus, error) {
-	return nil, fmt.Errorf("Firebase SMS delivery status not implemented yet")
-}
-
-func (f *FirebaseProvider) GetProviderName() string {
+func (fp *FirebaseSMSProvider) GetProviderName() string {
 	return "firebase"
 }
 
-// OneSignal Provider (placeholder implementation)
+// Mock Provider Implementation
 
-func (o *OneSignalProvider) SendSMS(to, message string) (*SMSResponse, error) {
-	// OneSignal primarily handles push notifications, not SMS
-	return nil, fmt.Errorf("OneSignal SMS not implemented yet")
+func (mp *MockSMSProvider) SendSMS(phoneNumber, message string) error {
+	// Log the SMS that would be sent
+	logger.Infof("Mock SMS to %s: %s", phoneNumber, message)
+
+	// Simulate some processing time
+	time.Sleep(100 * time.Millisecond)
+
+	return nil
 }
 
-func (o *OneSignalProvider) GetDeliveryStatus(messageID string) (*DeliveryStatus, error) {
-	return nil, fmt.Errorf("OneSignal SMS delivery status not implemented yet")
-}
-
-func (o *OneSignalProvider) GetProviderName() string {
-	return "onesignal"
-}
-
-// Mock Provider for testing
-
-type MockSMSProvider struct{}
-
-func (m *MockSMSProvider) SendSMS(to, message string) (*SMSResponse, error) {
-	logger.Infof("MOCK SMS to %s: %s", to, message)
-
-	return &SMSResponse{
-		MessageID: fmt.Sprintf("mock_%d", time.Now().Unix()),
-		Status:    "sent",
-		Provider:  "mock",
-		To:        to,
-		Message:   message,
-		Cost:      0.0,
-		Segments:  1,
-		Timestamp: time.Now(),
-	}, nil
-}
-
-func (m *MockSMSProvider) GetDeliveryStatus(messageID string) (*DeliveryStatus, error) {
-	return &DeliveryStatus{
-		MessageID:     messageID,
-		Status:        "delivered",
-		DeliveredAt:   time.Now(),
-		LastUpdatedAt: time.Now(),
-	}, nil
-}
-
-func (m *MockSMSProvider) GetProviderName() string {
+func (mp *MockSMSProvider) GetProviderName() string {
 	return "mock"
 }
 
-// Helper Functions
+// Utility Functions
 
-// mapTwilioStatus maps Twilio status to standard status
-func mapTwilioStatus(twilioStatus string) string {
-	switch twilioStatus {
-	case "queued", "accepted":
-		return "pending"
-	case "sending", "sent":
-		return "sent"
-	case "delivered":
-		return "delivered"
-	case "failed", "undelivered":
-		return "failed"
+// FormatPhoneNumber formats phone number for SMS providers
+func FormatPhoneNumber(phoneNumber string) string {
+	// Remove any non-digit characters except +
+	cleaned := ""
+	for _, char := range phoneNumber {
+		if char >= '0' && char <= '9' || char == '+' {
+			cleaned += string(char)
+		}
+	}
+
+	// Ensure it starts with +
+	if !strings.HasPrefix(cleaned, "+") {
+		cleaned = "+" + cleaned
+	}
+
+	return cleaned
+}
+
+// ValidatePhoneNumberForSMS validates phone number for SMS sending
+func ValidatePhoneNumberForSMS(phoneNumber string) error {
+	formatted := FormatPhoneNumber(phoneNumber)
+
+	// Basic validation
+	if len(formatted) < 8 || len(formatted) > 16 {
+		return fmt.Errorf("invalid phone number length")
+	}
+
+	if !strings.HasPrefix(formatted, "+") {
+		return fmt.Errorf("phone number must include country code")
+	}
+
+	return nil
+}
+
+// IsPhoneNumberSuppressed checks if phone number is in suppression list
+func (sms *SMSService) IsPhoneNumberSuppressed(phoneNumber string) bool {
+	// This would typically check against a database of suppressed numbers
+	// For now, return false
+	suppressedNumbers := []string{
+		"+1234567890", // Example suppressed number
+	}
+
+	formatted := FormatPhoneNumber(phoneNumber)
+	for _, suppressed := range suppressedNumbers {
+		if formatted == suppressed {
+			return true
+		}
+	}
+
+	return false
+}
+
+// GetSMSCost estimates SMS cost (for reporting/analytics)
+func (sms *SMSService) GetSMSCost(phoneNumber string) float64 {
+	// This is a simplified cost calculation
+	// In reality, costs vary by provider and destination country
+
+	switch sms.provider.GetProviderName() {
+	case "twilio":
+		// Basic Twilio pricing (varies by country)
+		if strings.HasPrefix(phoneNumber, "+1") { // US/Canada
+			return 0.0075 // $0.0075 per SMS
+		}
+		return 0.05 // International rate
+	case "firebase":
+		return 0.01 // Estimated cost
 	default:
-		return "unknown"
+		return 0.0 // Mock provider is free
 	}
 }
 
-// GetSMSService returns the global SMS service instance
-var globalSMSService *SMSService
-
-func GetSMSService() *SMSService {
-	return globalSMSService
+// SMSTemplate represents an SMS template
+type SMSTemplate struct {
+	ID        string            `json:"id"`
+	Name      string            `json:"name"`
+	Content   string            `json:"content"`
+	Variables []string          `json:"variables"`
+	Category  string            `json:"category"`
+	Language  string            `json:"language"`
+	IsActive  bool              `json:"is_active"`
+	Metadata  map[string]string `json:"metadata"`
 }
 
-func SetSMSService(service *SMSService) {
-	globalSMSService = service
+// GetSMSTemplates returns available SMS templates
+func (sms *SMSService) GetSMSTemplates() map[string]*SMSTemplate {
+	return map[string]*SMSTemplate{
+		"otp_verification": {
+			ID:        "otp_verification",
+			Name:      "OTP Verification",
+			Content:   "Your {{app_name}} verification code is: {{otp_code}}. Do not share this code with anyone.",
+			Variables: []string{"app_name", "otp_code"},
+			Category:  "authentication",
+			Language:  "en",
+			IsActive:  true,
+		},
+		"welcome": {
+			ID:        "welcome",
+			Name:      "Welcome Message",
+			Content:   "Welcome to {{app_name}}, {{user_name}}! Start chatting with friends and family now.",
+			Variables: []string{"app_name", "user_name"},
+			Category:  "onboarding",
+			Language:  "en",
+			IsActive:  true,
+		},
+		"password_reset": {
+			ID:        "password_reset",
+			Name:      "Password Reset",
+			Content:   "Your {{app_name}} password reset code is: {{reset_code}}. This code will expire in {{expiry_minutes}} minutes.",
+			Variables: []string{"app_name", "reset_code", "expiry_minutes"},
+			Category:  "security",
+			Language:  "en",
+			IsActive:  true,
+		},
+		"account_locked": {
+			ID:        "account_locked",
+			Name:      "Account Locked",
+			Content:   "Your {{app_name}} account has been temporarily locked due to suspicious activity. Please contact support if you need assistance.",
+			Variables: []string{"app_name"},
+			Category:  "security",
+			Language:  "en",
+			IsActive:  true,
+		},
+	}
+}
+
+// SendTemplatedSMS sends SMS using a template
+func (sms *SMSService) SendTemplatedSMS(phoneNumber, templateID string, variables map[string]string) error {
+	templates := sms.GetSMSTemplates()
+	template, exists := templates[templateID]
+	if !exists {
+		return fmt.Errorf("SMS template not found: %s", templateID)
+	}
+
+	if !template.IsActive {
+		return fmt.Errorf("SMS template is inactive: %s", templateID)
+	}
+
+	// Replace variables in template content
+	message := template.Content
+	for _, variable := range template.Variables {
+		if value, exists := variables[variable]; exists {
+			placeholder := fmt.Sprintf("{{%s}}", variable)
+			message = strings.ReplaceAll(message, placeholder, value)
+		}
+	}
+
+	// Send the SMS
+	err := sms.provider.SendSMS(phoneNumber, message)
+	if err != nil {
+		logger.LogSMSOperation(sms.provider.GetProviderName(), phoneNumber, false, err)
+		return fmt.Errorf("failed to send templated SMS: %w", err)
+	}
+
+	logger.LogSMSOperation(sms.provider.GetProviderName(), phoneNumber, true, nil)
+	logger.Infof("Sent templated SMS using template: %s", templateID)
+	return nil
+}
+
+// GetProviderName returns the current SMS provider name
+func (sms *SMSService) GetProviderName() string {
+	return sms.provider.GetProviderName()
+}
+
+// HealthCheck checks if SMS service is healthy
+func (sms *SMSService) HealthCheck() error {
+	// For mock provider, always return healthy
+	if sms.provider.GetProviderName() == "mock" {
+		return nil
+	}
+
+	// For real providers, you might want to test with a specific test number
+	// For now, just check if provider is configured
+	switch sms.provider.GetProviderName() {
+	case "twilio":
+		if tp, ok := sms.provider.(*TwilioSMSProvider); ok {
+			if tp.config.AccountSID == "" || tp.config.AuthToken == "" {
+				return fmt.Errorf("Twilio not properly configured")
+			}
+		}
+	case "firebase":
+		if fp, ok := sms.provider.(*FirebaseSMSProvider); ok {
+			if fp.config.ProjectID == "" {
+				return fmt.Errorf("Firebase not properly configured")
+			}
+		}
+	}
+
+	return nil
 }
