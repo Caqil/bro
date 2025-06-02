@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -12,718 +13,1343 @@ import (
 
 	"bro/internal/config"
 	"bro/internal/models"
-	"bro/internal/utils"
+	"bro/internal/webrtc"
+	"bro/internal/websocket"
 	"bro/pkg/database"
 	"bro/pkg/logger"
 	"bro/pkg/redis"
 )
 
-// CallService handles call operations
+// CallService handles all call-related operations
 type CallService struct {
-	config      *config.Config
-	db          *mongo.Database
-	collections *database.Collections
-	redisClient *redis.Client
-	pushService *PushService
+	// Configuration
+	config *config.Config
+
+	// Database collections
+	callsCollection    *mongo.Collection
+	usersCollection    *mongo.Collection
+	chatsCollection    *mongo.Collection
+	messagesCollection *mongo.Collection
+
+	// External services
+	signalingServer *webrtc.SignalingServer
+	hub             *websocket.Hub
+	redisClient     *redis.Client
+	pushService     *PushService
+	smsService      *SMSService
+
+	// Call management
+	activeCalls   map[primitive.ObjectID]*CallSession
+	callsMutex    sync.RWMutex
+	callTimeouts  map[primitive.ObjectID]*time.Timer
+	timeoutsMutex sync.RWMutex
+
+	// Statistics
+	callStats *CallStatistics
+
+	// Lifecycle
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 }
 
 // CallSession represents an active call session
 type CallSession struct {
-	CallID       primitive.ObjectID             `json:"call_id"`
-	RoomID       string                         `json:"room_id"`
-	Participants map[string]*SessionParticipant `json:"participants"`
-	State        CallState                      `json:"state"`
-	CreatedAt    time.Time                      `json:"created_at"`
-	UpdatedAt    time.Time                      `json:"updated_at"`
+	Call         *models.Call
+	Room         *webrtc.Room
+	Participants map[primitive.ObjectID]*CallParticipantInfo
+	StartTime    time.Time
+	IsActive     bool
+	IsRecording  bool
+	QualityData  map[primitive.ObjectID]*models.QualityMetrics
+	Events       []CallEvent
+	mutex        sync.RWMutex
 }
 
-// SessionParticipant represents a participant in a call session
-type SessionParticipant struct {
-	UserID       primitive.ObjectID `json:"user_id"`
-	ConnectionID string             `json:"connection_id"`
-	Status       string             `json:"status"` // "connecting", "connected", "disconnected"
-	JoinedAt     *time.Time         `json:"joined_at,omitempty"`
-	MediaState   MediaState         `json:"media_state"`
-	DeviceInfo   DeviceInfo         `json:"device_info"`
-	NetworkStats *NetworkStats      `json:"network_stats,omitempty"`
-	LastPingAt   time.Time          `json:"last_ping_at"`
+// CallParticipantInfo contains participant information
+type CallParticipantInfo struct {
+	UserID         primitive.ObjectID
+	PeerID         string
+	ConnectionID   string
+	Status         models.ParticipantStatus
+	JoinedAt       *time.Time
+	LeftAt         *time.Time
+	MediaState     models.MediaState
+	DeviceInfo     models.DeviceInfo
+	QualityMetrics *models.QualityMetrics
+	LastActivity   time.Time
 }
 
-// MediaState represents participant's media state
-type MediaState struct {
-	VideoEnabled  bool   `json:"video_enabled"`
-	AudioEnabled  bool   `json:"audio_enabled"`
-	ScreenSharing bool   `json:"screen_sharing"`
-	VideoQuality  string `json:"video_quality"`
-	AudioQuality  string `json:"audio_quality"`
+// CallEvent represents a call event
+type CallEvent struct {
+	Type      string
+	UserID    primitive.ObjectID
+	Data      map[string]interface{}
+	Timestamp time.Time
 }
 
-// DeviceInfo represents device information
-type DeviceInfo struct {
-	Platform     string   `json:"platform"`
-	Browser      string   `json:"browser,omitempty"`
-	Version      string   `json:"version,omitempty"`
-	Capabilities []string `json:"capabilities"`
+// CallStatistics contains call service statistics
+type CallStatistics struct {
+	TotalCalls          int64
+	ActiveCalls         int
+	CallsToday          int64
+	AverageCallDuration time.Duration
+	SuccessRate         float64
+	LastUpdated         time.Time
+	mutex               sync.RWMutex
 }
 
-// NetworkStats represents network statistics
-type NetworkStats struct {
-	Bitrate     int       `json:"bitrate"`
-	PacketLoss  float64   `json:"packet_loss"`
-	Jitter      float64   `json:"jitter"`
-	RTT         int       `json:"rtt"`
-	LastUpdated time.Time `json:"last_updated"`
-}
-
-// CallState represents call session state
-type CallState string
-
-const (
-	CallStateInitiating CallState = "initiating"
-	CallStateRinging    CallState = "ringing"
-	CallStateActive     CallState = "active"
-	CallStateEnding     CallState = "ending"
-	CallStateEnded      CallState = "ended"
-)
-
-// SignalingMessage represents WebRTC signaling message
-type SignalingMessage struct {
-	Type       string                 `json:"type"`
-	CallID     string                 `json:"call_id"`
-	FromUserID string                 `json:"from_user_id"`
-	ToUserID   string                 `json:"to_user_id,omitempty"`
-	Data       map[string]interface{} `json:"data"`
-	Timestamp  time.Time              `json:"timestamp"`
-}
-
-// CallRequest represents call initiation request
+// CallRequest represents a call initiation request
 type CallRequest struct {
-	Type         models.CallType      `json:"type"`
-	Participants []primitive.ObjectID `json:"participants"`
-	ChatID       primitive.ObjectID   `json:"chat_id"`
-	VideoEnabled bool                 `json:"video_enabled"`
-	Settings     *models.CallSettings `json:"settings,omitempty"`
+	InitiatorID    primitive.ObjectID
+	ParticipantIDs []primitive.ObjectID
+	ChatID         primitive.ObjectID
+	Type           models.CallType
+	VideoEnabled   bool
+	AudioEnabled   bool
+	DeviceInfo     models.DeviceInfo
+	Settings       *models.CallSettings
 }
 
-// CallAnswer represents call answer
-type CallAnswer struct {
-	Accept       bool                 `json:"accept"`
-	VideoEnabled bool                 `json:"video_enabled"`
-	RejectReason *models.RejectReason `json:"reject_reason,omitempty"`
+// CallResponse represents call operation response
+type CallResponse struct {
+	Call         *models.Call              `json:"call"`
+	Room         *CallRoomInfo             `json:"room,omitempty"`
+	Participants []CallParticipantResponse `json:"participants"`
+	TURNServers  []models.TURNServer       `json:"turn_servers,omitempty"`
+	IceServers   []map[string]interface{}  `json:"ice_servers,omitempty"`
+	SignalingURL string                    `json:"signaling_url,omitempty"`
 }
 
-// CallControlAction represents call control action
-type CallControlAction struct {
-	Action string                 `json:"action"`
-	Data   map[string]interface{} `json:"data,omitempty"`
+// CallRoomInfo contains room information
+type CallRoomInfo struct {
+	RoomID      string                 `json:"room_id"`
+	MaxPeers    int                    `json:"max_peers"`
+	ActivePeers int                    `json:"active_peers"`
+	Quality     string                 `json:"quality"`
+	IsRecording bool                   `json:"is_recording"`
+	Settings    map[string]interface{} `json:"settings"`
 }
 
-// ICEServers represents ICE servers configuration
-type ICEServers struct {
-	STUNServers []STUNServer `json:"stun_servers"`
-	TURNServers []TURNServer `json:"turn_servers"`
-}
-
-// STUNServer represents STUN server configuration
-type STUNServer struct {
-	URL string `json:"url"`
-}
-
-// TURNServer represents TURN server configuration
-type TURNServer struct {
-	URLs       []string `json:"urls"`
-	Username   string   `json:"username"`
-	Credential string   `json:"credential"`
+// CallParticipantResponse contains participant response data
+type CallParticipantResponse struct {
+	UserID     primitive.ObjectID       `json:"user_id"`
+	UserInfo   models.UserPublicInfo    `json:"user_info"`
+	Status     models.ParticipantStatus `json:"status"`
+	JoinedAt   *time.Time               `json:"joined_at,omitempty"`
+	MediaState models.MediaState        `json:"media_state"`
+	DeviceInfo models.DeviceInfo        `json:"device_info"`
+	Quality    *models.QualityMetrics   `json:"quality,omitempty"`
 }
 
 // NewCallService creates a new call service
-func NewCallService(config *config.Config, pushService *PushService) *CallService {
-	db := database.GetDB()
+func NewCallService(
+	cfg *config.Config,
+	signalingServer *webrtc.SignalingServer,
+	hub *websocket.Hub,
+	pushService *PushService,
+	smsService *SMSService,
+) (*CallService, error) {
+
 	collections := database.GetCollections()
-	redisClient := redis.GetClient()
+	if collections == nil {
+		return nil, fmt.Errorf("database collections not available")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
 
 	service := &CallService{
-		config:      config,
-		db:          db,
-		collections: collections,
-		redisClient: redisClient,
-		pushService: pushService,
+		config:             cfg,
+		callsCollection:    collections.Calls,
+		usersCollection:    collections.Users,
+		chatsCollection:    collections.Chats,
+		messagesCollection: collections.Messages,
+		signalingServer:    signalingServer,
+		hub:                hub,
+		redisClient:        redis.GetClient(),
+		pushService:        pushService,
+		smsService:         smsService,
+		activeCalls:        make(map[primitive.ObjectID]*CallSession),
+		callTimeouts:       make(map[primitive.ObjectID]*time.Timer),
+		callStats:          &CallStatistics{},
+		ctx:                ctx,
+		cancel:             cancel,
 	}
 
-	// Start background tasks
-	go service.cleanupStaleConnections()
-	go service.updateCallMetrics()
+	// Start background processes
+	service.wg.Add(3)
+	go service.statsCollector()
+	go service.callTimeoutManager()
+	go service.qualityMonitor()
 
-	logger.Info("Call service initialized successfully")
-	return service
+	logger.Info("Call Service initialized successfully")
+	return service, nil
 }
 
-// Public Call Service Methods
-
-// InitiateCall initiates a new call
-func (s *CallService) InitiateCall(initiatorID primitive.ObjectID, request *CallRequest) (*models.Call, *ICEServers, error) {
-	startTime := time.Now()
-
+// InitiateCall starts a new call
+func (cs *CallService) InitiateCall(req *CallRequest) (*CallResponse, error) {
 	// Validate request
-	if err := s.validateCallRequest(request); err != nil {
-		return nil, nil, fmt.Errorf("validation failed: %w", err)
+	if err := cs.validateCallRequest(req); err != nil {
+		return nil, fmt.Errorf("invalid call request: %w", err)
 	}
 
-	// Check if initiator can make calls
-	if err := s.checkCallPermissions(initiatorID, request.ChatID); err != nil {
-		return nil, nil, fmt.Errorf("permission denied: %w", err)
+	// Check if users are available for calling
+	if err := cs.checkParticipantsAvailability(req.ParticipantIDs); err != nil {
+		return nil, fmt.Errorf("participants not available: %w", err)
 	}
 
-	// Check participant availability
-	unavailableUsers, err := s.checkParticipantAvailability(request.Participants)
+	// Create call in database
+	call, err := cs.createCall(req)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to check availability: %w", err)
-	}
-	if len(unavailableUsers) > 0 {
-		return nil, nil, fmt.Errorf("some participants are unavailable")
+		return nil, fmt.Errorf("failed to create call: %w", err)
 	}
 
-	// Create call
-	call := &models.Call{
-		Type:        request.Type,
-		Status:      models.CallStatusInitiating,
-		InitiatorID: initiatorID,
-		ChatID:      request.ChatID,
-		SessionID:   primitive.NewObjectID().Hex(),
+	// Create call session
+	session, err := cs.createCallSession(call)
+	if err != nil {
+		// Cleanup call if session creation fails
+		cs.deleteCall(call.ID)
+		return nil, fmt.Errorf("failed to create call session: %w", err)
 	}
 
-	// Add participants
-	for _, participantID := range request.Participants {
-		role := models.ParticipantRoleParticipant
-		if participantID == initiatorID {
-			role = models.ParticipantRoleInitiator
+	// Store active call
+	cs.callsMutex.Lock()
+	cs.activeCalls[call.ID] = session
+	cs.callsMutex.Unlock()
+
+	// Set call timeout
+	cs.setCallTimeout(call.ID, 30*time.Second) // 30 seconds to answer
+
+	// Send notifications to participants
+	go cs.notifyParticipants(call, "call_invitation")
+
+	// Create system message in chat
+	go cs.createCallMessage(call, "call_initiated")
+
+	// Update statistics
+	cs.updateCallStats("initiated")
+
+	// Prepare response
+	response := &CallResponse{
+		Call:         call,
+		Participants: cs.buildParticipantResponses(session),
+		TURNServers:  cs.getTURNServers(),
+		IceServers:   cs.config.GetTURNServers(),
+		SignalingURL: cs.getSignalingURL(),
+	}
+
+	if session.Room != nil {
+		response.Room = &CallRoomInfo{
+			RoomID:      session.Room.ID,
+			MaxPeers:    session.Room.MaxPeers,
+			ActivePeers: session.Room.PeerCount,
+			IsRecording: session.IsRecording,
 		}
-		call.AddParticipant(participantID, role)
 	}
 
-	// Set call settings
-	if request.Settings != nil {
-		call.Settings = *request.Settings
-	}
-
-	call.BeforeCreate()
-
-	// Save call to database
-	if err := s.saveCall(call); err != nil {
-		return nil, nil, fmt.Errorf("failed to save call: %w", err)
-	}
-
-	// Create call session in Redis
-	session := &CallSession{
-		CallID:       call.ID,
-		RoomID:       call.SessionID,
-		Participants: make(map[string]*SessionParticipant),
-		State:        CallStateInitiating,
-		CreatedAt:    time.Now(),
-		UpdatedAt:    time.Now(),
-	}
-
-	if err := s.saveCallSession(session); err != nil {
-		logger.Errorf("Failed to save call session: %v", err)
-	}
-
-	// Send call notifications to participants
-	go s.sendCallNotifications(call, "incoming_call")
-
-	// Get ICE servers configuration
-	iceServers := s.getICEServers()
-
-	// Log call initiation
-	duration := time.Since(startTime)
-	s.logCallEvent("call_initiated", call, map[string]interface{}{
-		"duration_ms":       duration.Milliseconds(),
-		"participant_count": len(request.Participants),
-		"video_enabled":     request.VideoEnabled,
+	logger.LogUserAction(req.InitiatorID.Hex(), "call_initiated", "call_service", map[string]interface{}{
+		"call_id":      call.ID.Hex(),
+		"call_type":    call.Type,
+		"participants": len(req.ParticipantIDs),
+		"chat_id":      req.ChatID.Hex(),
 	})
 
-	logger.Infof("Call initiated: %s (Type: %s, Participants: %d)",
-		call.ID.Hex(), call.Type, len(call.Participants))
-
-	return call, iceServers, nil
+	return response, nil
 }
 
-// AnswerCall answers an incoming call
-func (s *CallService) AnswerCall(callID primitive.ObjectID, userID primitive.ObjectID, answer *CallAnswer) error {
-	startTime := time.Now()
+// AnswerCall handles call answer
+func (cs *CallService) AnswerCall(callID primitive.ObjectID, userID primitive.ObjectID, accept bool, deviceInfo models.DeviceInfo) (*CallResponse, error) {
+	// Get active call session
+	cs.callsMutex.RLock()
+	session, exists := cs.activeCalls[callID]
+	cs.callsMutex.RUnlock()
 
-	// Get call
-	call, err := s.getCall(callID)
-	if err != nil {
-		return fmt.Errorf("call not found: %w", err)
+	if !exists {
+		return nil, fmt.Errorf("call not found or not active")
 	}
+
+	session.mutex.Lock()
+	defer session.mutex.Unlock()
 
 	// Check if user is a participant
-	participant := call.GetParticipant(userID)
-	if participant == nil {
-		return fmt.Errorf("user is not a participant in this call")
+	participantInfo, exists := session.Participants[userID]
+	if !exists {
+		return nil, fmt.Errorf("user not invited to this call")
 	}
 
-	// Check call state
-	if !call.IsActive() {
-		return fmt.Errorf("call is not active")
-	}
+	if !accept {
+		// Call rejected
+		participantInfo.Status = models.ParticipantStatusRejected
+		now := time.Now()
+		participantInfo.LeftAt = &now
 
-	// Update participant status
-	if answer.Accept {
-		call.UpdateParticipantStatus(userID, models.ParticipantStatusConnected)
+		// Update call in database
+		cs.updateCallParticipant(callID, userID, models.ParticipantStatusRejected)
 
-		// Update media state
-		participant.MediaState.VideoEnabled = answer.VideoEnabled
-		participant.MediaState.AudioEnabled = true
+		// Notify other participants
+		go cs.notifyParticipantsExcept(session.Call, "call_rejected", userID, map[string]interface{}{
+			"user_id": userID.Hex(),
+		})
 
-		// Set call status to active if this is the first acceptance
-		if call.Status == models.CallStatusRinging {
-			call.Status = models.CallStatusActive
-			call.StartCall()
-		}
-	} else {
-		call.UpdateParticipantStatus(userID, models.ParticipantStatusRejected)
-
-		// Set reject reason
-		if answer.RejectReason != nil {
-			participant.RejectReason = answer.RejectReason
+		// Check if all participants rejected
+		if cs.areAllParticipantsRejected(session) {
+			go cs.endCall(callID, userID, models.EndReasonRejected)
 		}
 
-		// End call if all participants rejected
-		if s.allParticipantsRejected(call) {
-			call.EndCall(userID, models.EndReasonRejected)
-		}
+		logger.LogUserAction(userID.Hex(), "call_rejected", "call_service", map[string]interface{}{
+			"call_id": callID.Hex(),
+		})
+
+		return nil, fmt.Errorf("call rejected")
 	}
 
-	// Update call in database
-	if err := s.updateCall(call); err != nil {
-		return fmt.Errorf("failed to update call: %w", err)
+	// Call accepted
+	participantInfo.Status = models.ParticipantStatusConnecting
+	now := time.Now()
+	participantInfo.JoinedAt = &now
+	participantInfo.DeviceInfo = deviceInfo
+
+	// Update call status if first acceptance
+	if session.Call.Status == models.CallStatusRinging {
+		session.Call.Status = models.CallStatusConnecting
+		session.Call.BeforeUpdate()
+		cs.updateCallStatus(callID, models.CallStatusConnecting)
 	}
 
-	// Update call session
-	if session, err := s.getCallSession(call.ID); err == nil {
-		if answer.Accept {
-			session.State = CallStateActive
-		}
-		session.UpdatedAt = time.Now()
-		s.saveCallSession(session)
-	}
+	// Update participant in database
+	cs.updateCallParticipant(callID, userID, models.ParticipantStatusConnecting)
 
-	// Send notifications
-	eventType := "call_accepted"
-	if !answer.Accept {
-		eventType = "call_rejected"
-	}
-	go s.sendCallNotifications(call, eventType)
+	// Clear call timeout
+	cs.clearCallTimeout(callID)
 
-	// Log call answer
-	duration := time.Since(startTime)
-	s.logCallEvent("call_answered", call, map[string]interface{}{
-		"user_id":       userID.Hex(),
-		"accepted":      answer.Accept,
-		"duration_ms":   duration.Milliseconds(),
-		"video_enabled": answer.VideoEnabled,
+	// Notify other participants
+	go cs.notifyParticipantsExcept(session.Call, "call_accepted", userID, map[string]interface{}{
+		"user_id": userID.Hex(),
 	})
 
-	logger.Infof("Call answered: %s (User: %s, Accepted: %v)",
-		call.ID.Hex(), userID.Hex(), answer.Accept)
+	// Create response
+	response := &CallResponse{
+		Call:         session.Call,
+		Participants: cs.buildParticipantResponses(session),
+		TURNServers:  cs.getTURNServers(),
+		IceServers:   cs.config.GetTURNServers(),
+		SignalingURL: cs.getSignalingURL(),
+	}
 
-	return nil
+	if session.Room != nil {
+		response.Room = &CallRoomInfo{
+			RoomID:      session.Room.ID,
+			MaxPeers:    session.Room.MaxPeers,
+			ActivePeers: session.Room.PeerCount,
+			IsRecording: session.IsRecording,
+		}
+	}
+
+	logger.LogUserAction(userID.Hex(), "call_accepted", "call_service", map[string]interface{}{
+		"call_id": callID.Hex(),
+	})
+
+	return response, nil
 }
 
-// EndCall ends a call
-func (s *CallService) EndCall(callID primitive.ObjectID, userID primitive.ObjectID, reason models.EndReason) error {
-	startTime := time.Now()
+// EndCall ends an active call
+func (cs *CallService) EndCall(callID primitive.ObjectID, userID primitive.ObjectID, reason models.EndReason) error {
+	return cs.endCall(callID, userID, reason)
+}
 
-	// Get call
-	call, err := s.getCall(callID)
-	if err != nil {
-		return fmt.Errorf("call not found: %w", err)
+// endCall internal method to end a call
+func (cs *CallService) endCall(callID primitive.ObjectID, endedBy primitive.ObjectID, reason models.EndReason) error {
+	// Get active call session
+	cs.callsMutex.Lock()
+	session, exists := cs.activeCalls[callID]
+	if exists {
+		delete(cs.activeCalls, callID)
+	}
+	cs.callsMutex.Unlock()
+
+	if !exists {
+		// Try to end call in database anyway
+		return cs.endCallInDatabase(callID, endedBy, reason)
 	}
 
-	// Check if user can end the call
-	participant := call.GetParticipant(userID)
-	if participant == nil {
-		return fmt.Errorf("user is not a participant in this call")
-	}
+	session.mutex.Lock()
+	defer session.mutex.Unlock()
 
-	// End the call
-	call.EndCall(userID, reason)
+	// Mark session as inactive
+	session.IsActive = false
+
+	// Calculate call duration
+	var duration time.Duration
+	if session.Call.StartedAt != nil {
+		duration = time.Since(*session.Call.StartedAt)
+	} else {
+		duration = time.Since(session.StartTime)
+	}
 
 	// Update call in database
-	if err := s.updateCall(call); err != nil {
-		return fmt.Errorf("failed to update call: %w", err)
+	now := time.Now()
+	session.Call.EndCall(endedBy, reason)
+	session.Call.Duration = int64(duration.Seconds())
+
+	// Update all participants
+	for userID, participant := range session.Participants {
+		if participant.Status == models.ParticipantStatusConnected {
+			participant.Status = models.ParticipantStatusDisconnected
+			if participant.LeftAt == nil {
+				participant.LeftAt = &now
+			}
+		}
 	}
 
-	// Clean up call session
-	if err := s.deleteCallSession(call.ID); err != nil {
-		logger.Errorf("Failed to delete call session: %v", err)
+	// Save call to database
+	if err := cs.saveCallToDatabase(session.Call); err != nil {
+		logger.Errorf("Failed to save call to database: %v", err)
 	}
 
-	// Send call ended notifications
-	go s.sendCallNotifications(call, "call_ended")
+	// Close WebRTC room if exists
+	if session.Room != nil {
+		go func() {
+			if err := session.Room.Close(); err != nil {
+				logger.Errorf("Failed to close WebRTC room: %v", err)
+			}
+		}()
+	}
 
-	// Process call for analytics
-	go s.processCallAnalytics(call)
+	// Clear timeout
+	cs.clearCallTimeout(callID)
 
-	// Log call end
-	duration := time.Since(startTime)
-	s.logCallEvent("call_ended", call, map[string]interface{}{
-		"ended_by":      userID.Hex(),
-		"reason":        string(reason),
-		"call_duration": call.Duration,
-		"duration_ms":   duration.Milliseconds(),
+	// Notify all participants
+	go cs.notifyAllParticipants(session.Call, "call_ended", map[string]interface{}{
+		"ended_by": endedBy.Hex(),
+		"reason":   reason,
+		"duration": duration.Seconds(),
+		"ended_at": now,
 	})
 
-	logger.Infof("Call ended: %s (Duration: %s, Reason: %s)",
-		call.ID.Hex(), utils.FormatDuration(call.Duration), reason)
+	// Create system message
+	go cs.createCallMessage(session.Call, "call_ended")
+
+	// Update statistics
+	cs.updateCallStats("ended")
+
+	logger.LogUserAction(endedBy.Hex(), "call_ended", "call_service", map[string]interface{}{
+		"call_id":  callID.Hex(),
+		"reason":   reason,
+		"duration": duration.Seconds(),
+	})
 
 	return nil
 }
 
 // JoinCall allows a user to join an ongoing call
-func (s *CallService) JoinCall(callID primitive.ObjectID, userID primitive.ObjectID, connectionID string, mediaState MediaState, deviceInfo DeviceInfo) error {
-	// Get call
-	call, err := s.getCall(callID)
-	if err != nil {
-		return fmt.Errorf("call not found: %w", err)
+func (cs *CallService) JoinCall(callID primitive.ObjectID, userID primitive.ObjectID, deviceInfo models.DeviceInfo) (*CallResponse, error) {
+	// Get active call session
+	cs.callsMutex.RLock()
+	session, exists := cs.activeCalls[callID]
+	cs.callsMutex.RUnlock()
+
+	if !exists {
+		return nil, fmt.Errorf("call not found or not active")
 	}
+
+	session.mutex.Lock()
+	defer session.mutex.Unlock()
 
 	// Check if user can join
-	if !call.CanUserJoin(userID) {
-		return fmt.Errorf("cannot join call")
+	if len(session.Participants) >= session.Call.Settings.MaxParticipants {
+		return nil, fmt.Errorf("call has reached maximum participants")
 	}
 
-	// Get call session
-	session, err := s.getCallSession(call.ID)
-	if err != nil {
-		return fmt.Errorf("call session not found: %w", err)
+	// Check if user is already in call
+	if _, exists := session.Participants[userID]; exists {
+		return nil, fmt.Errorf("user already in call")
 	}
 
-	// Add participant to session
-	participant := &SessionParticipant{
-		UserID:       userID,
-		ConnectionID: connectionID,
-		Status:       "connecting",
-		MediaState:   mediaState,
-		DeviceInfo:   deviceInfo,
-		LastPingAt:   time.Now(),
+	// Add participant to call
+	now := time.Now()
+	participantInfo := &CallParticipantInfo{
+		UserID:         userID,
+		Status:         models.ParticipantStatusConnecting,
+		JoinedAt:       &now,
+		DeviceInfo:     deviceInfo,
+		MediaState:     models.MediaState{},
+		QualityMetrics: &models.QualityMetrics{},
+		LastActivity:   now,
 	}
 
-	session.Participants[connectionID] = participant
-	session.UpdatedAt = time.Now()
+	session.Participants[userID] = participantInfo
 
-	// Save session
-	if err := s.saveCallSession(session); err != nil {
-		return fmt.Errorf("failed to save session: %w", err)
+	// Add to database
+	participant := models.CallParticipant{
+		UserID:     userID,
+		Status:     models.ParticipantStatusConnecting,
+		Role:       models.ParticipantRoleParticipant,
+		JoinedAt:   &now,
+		DeviceInfo: deviceInfo,
+		MediaState: models.MediaState{},
 	}
 
-	// Update call participant status
-	call.UpdateParticipantStatus(userID, models.ParticipantStatusConnecting)
-	s.updateCall(call)
+	session.Call.Participants = append(session.Call.Participants, participant)
+	cs.saveCallToDatabase(session.Call)
 
-	s.logCallEvent("user_joined", call, map[string]interface{}{
-		"user_id":       userID.Hex(),
-		"connection_id": connectionID,
-		"media_state":   mediaState,
+	// Notify other participants
+	go cs.notifyParticipantsExcept(session.Call, "participant_joined", userID, map[string]interface{}{
+		"user_id":   userID.Hex(),
+		"joined_at": now,
 	})
 
-	return nil
-}
-
-// LeaveCall allows a user to leave a call
-func (s *CallService) LeaveCall(callID primitive.ObjectID, userID primitive.ObjectID, connectionID string) error {
-	// Get call session
-	session, err := s.getCallSession(callID)
-	if err != nil {
-		return fmt.Errorf("call session not found: %w", err)
+	// Create response
+	response := &CallResponse{
+		Call:         session.Call,
+		Participants: cs.buildParticipantResponses(session),
+		TURNServers:  cs.getTURNServers(),
+		IceServers:   cs.config.GetTURNServers(),
+		SignalingURL: cs.getSignalingURL(),
 	}
 
-	// Remove participant from session
-	if participant, exists := session.Participants[connectionID]; exists {
-		participant.Status = "disconnected"
-		now := time.Now()
-		participant.JoinedAt = &now
-
-		// Remove after a short delay to allow for reconnection
-		go func() {
-			time.Sleep(30 * time.Second)
-			delete(session.Participants, connectionID)
-			s.saveCallSession(session)
-		}()
-	}
-
-	session.UpdatedAt = time.Now()
-	s.saveCallSession(session)
-
-	// Update call
-	call, err := s.getCall(callID)
-	if err == nil {
-		call.UpdateParticipantStatus(userID, models.ParticipantStatusDisconnected)
-		s.updateCall(call)
-
-		// End call if no participants left
-		if len(s.getConnectedParticipants(session)) == 0 {
-			call.EndCall(userID, models.EndReasonNormal)
-			s.updateCall(call)
-			s.deleteCallSession(callID)
+	if session.Room != nil {
+		response.Room = &CallRoomInfo{
+			RoomID:      session.Room.ID,
+			MaxPeers:    session.Room.MaxPeers,
+			ActivePeers: session.Room.PeerCount,
+			IsRecording: session.IsRecording,
 		}
 	}
 
-	s.logCallEvent("user_left", call, map[string]interface{}{
-		"user_id":       userID.Hex(),
-		"connection_id": connectionID,
+	logger.LogUserAction(userID.Hex(), "call_joined", "call_service", map[string]interface{}{
+		"call_id": callID.Hex(),
 	})
 
-	return nil
+	return response, nil
 }
 
-// UpdateMediaState updates participant's media state
-func (s *CallService) UpdateMediaState(callID primitive.ObjectID, connectionID string, mediaState MediaState) error {
-	// Get call session
-	session, err := s.getCallSession(callID)
-	if err != nil {
-		return fmt.Errorf("call session not found: %w", err)
+// LeaveCall handles a user leaving a call
+func (cs *CallService) LeaveCall(callID primitive.ObjectID, userID primitive.ObjectID) error {
+	// Get active call session
+	cs.callsMutex.RLock()
+	session, exists := cs.activeCalls[callID]
+	cs.callsMutex.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("call not found or not active")
 	}
 
-	// Update participant media state
-	if participant, exists := session.Participants[connectionID]; exists {
-		participant.MediaState = mediaState
-		participant.LastPingAt = time.Now()
-		session.UpdatedAt = time.Now()
+	session.mutex.Lock()
+	defer session.mutex.Unlock()
 
-		// Save session
-		if err := s.saveCallSession(session); err != nil {
-			return fmt.Errorf("failed to save session: %w", err)
+	// Find participant
+	participantInfo, exists := session.Participants[userID]
+	if !exists {
+		return fmt.Errorf("user not in call")
+	}
+
+	// Update participant status
+	participantInfo.Status = models.ParticipantStatusDisconnected
+	now := time.Now()
+	participantInfo.LeftAt = &now
+
+	// Update in database
+	cs.updateCallParticipant(callID, userID, models.ParticipantStatusDisconnected)
+
+	// Notify other participants
+	go cs.notifyParticipantsExcept(session.Call, "participant_left", userID, map[string]interface{}{
+		"user_id": userID.Hex(),
+		"left_at": now,
+	})
+
+	// Check if call should end (no active participants)
+	activeParticipants := 0
+	for _, p := range session.Participants {
+		if p.Status == models.ParticipantStatusConnected || p.Status == models.ParticipantStatusConnecting {
+			activeParticipants++
 		}
 	}
 
-	return nil
-}
-
-// HandleSignaling handles WebRTC signaling messages
-func (s *CallService) HandleSignaling(message *SignalingMessage) error {
-	// Get call session
-	callID, err := primitive.ObjectIDFromHex(message.CallID)
-	if err != nil {
-		return fmt.Errorf("invalid call ID: %w", err)
+	if activeParticipants <= 1 {
+		// End call if only one or no participants left
+		go cs.endCall(callID, userID, models.EndReasonNormal)
 	}
 
-	session, err := s.getCallSession(callID)
-	if err != nil {
-		return fmt.Errorf("call session not found: %w", err)
-	}
-
-	// Log signaling message
-	s.logCallEvent("signaling_message", nil, map[string]interface{}{
-		"call_id":   message.CallID,
-		"type":      message.Type,
-		"from_user": message.FromUserID,
-		"to_user":   message.ToUserID,
-		"data_size": len(fmt.Sprintf("%v", message.Data)),
+	logger.LogUserAction(userID.Hex(), "call_left", "call_service", map[string]interface{}{
+		"call_id": callID.Hex(),
 	})
 
-	// Process based on message type
-	switch message.Type {
-	case "offer", "answer":
-		// Forward to target participant
-		return s.forwardSignalingMessage(session, message)
-	case "ice-candidate":
-		// Forward ICE candidate
-		return s.forwardSignalingMessage(session, message)
-	case "ping":
-		// Handle ping for keep-alive
-		return s.handlePing(session, message)
-	default:
-		logger.Warnf("Unknown signaling message type: %s", message.Type)
-	}
-
 	return nil
 }
 
-// GetCallHistory gets call history for user
-func (s *CallService) GetCallHistory(userID primitive.ObjectID, limit, offset int) ([]*models.Call, int64, error) {
+// GetCallHistory returns user's call history
+func (cs *CallService) GetCallHistory(userID primitive.ObjectID, page, limit int) (*models.CallHistoryResponse, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// Build filter for calls where user is a participant
+	// Calculate skip
+	skip := (page - 1) * limit
+
+	// Build query to find calls where user is a participant
 	filter := bson.M{
 		"participants.user_id": userID,
 	}
 
-	// Get total count
-	total, err := s.collections.Calls.CountDocuments(ctx, filter)
+	// Count total calls
+	total, err := cs.callsCollection.CountDocuments(ctx, filter)
 	if err != nil {
-		return nil, 0, fmt.Errorf("failed to count calls: %w", err)
+		return nil, fmt.Errorf("failed to count calls: %w", err)
 	}
 
-	// Get calls
+	// Find calls with pagination
 	opts := options.Find().
-		SetSort(bson.D{{"created_at", -1}}).
-		SetLimit(int64(limit)).
-		SetSkip(int64(offset))
+		SetSort(bson.D{{Key: "initiated_at", Value: -1}}).
+		SetSkip(int64(skip)).
+		SetLimit(int64(limit))
 
-	cursor, err := s.collections.Calls.Find(ctx, filter, opts)
+	cursor, err := cs.callsCollection.Find(ctx, filter, opts)
 	if err != nil {
-		return nil, 0, fmt.Errorf("failed to find calls: %w", err)
+		return nil, fmt.Errorf("failed to find calls: %w", err)
 	}
 	defer cursor.Close(ctx)
 
-	var calls []*models.Call
+	var calls []models.Call
 	if err := cursor.All(ctx, &calls); err != nil {
-		return nil, 0, fmt.Errorf("failed to decode calls: %w", err)
+		return nil, fmt.Errorf("failed to decode calls: %w", err)
 	}
 
-	return calls, total, nil
+	// Convert to response format
+	callResponses := make([]models.CallResponse, len(calls))
+	for i, call := range calls {
+		// Find user's participant info
+		var myParticipant *models.CallParticipant
+		for _, p := range call.Participants {
+			if p.UserID == userID {
+				myParticipant = &p
+				break
+			}
+		}
+
+		callResponses[i] = models.CallResponse{
+			Call:          call,
+			MyParticipant: myParticipant,
+			CanControl:    call.InitiatorID == userID,
+			CanRecord:     call.Settings.RecordingEnabled,
+			CanInvite:     true,
+			TURNServers:   cs.getTURNServers(),
+		}
+	}
+
+	return &models.CallHistoryResponse{
+		Calls:      callResponses,
+		TotalCount: total,
+		HasMore:    int64(skip+limit) < total,
+	}, nil
 }
 
-// GetActiveCall gets active call for user
-func (s *CallService) GetActiveCall(userID primitive.ObjectID) (*models.Call, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+// GetActiveCall returns information about an active call
+func (cs *CallService) GetActiveCall(callID primitive.ObjectID, userID primitive.ObjectID) (*CallResponse, error) {
+	// Get active call session
+	cs.callsMutex.RLock()
+	session, exists := cs.activeCalls[callID]
+	cs.callsMutex.RUnlock()
 
-	filter := bson.M{
-		"participants.user_id": userID,
-		"status": bson.M{
-			"$in": []models.CallStatus{
-				models.CallStatusInitiating,
-				models.CallStatusRinging,
-				models.CallStatusConnecting,
-				models.CallStatusActive,
-			},
-		},
+	if !exists {
+		return nil, fmt.Errorf("call not found or not active")
 	}
 
-	var call models.Call
-	err := s.collections.Calls.FindOne(ctx, filter).Decode(&call)
-	if err != nil {
-		if err == mongo.ErrNoDocuments {
-			return nil, nil
+	session.mutex.RLock()
+	defer session.mutex.RUnlock()
+
+	// Check if user is participant
+	if _, exists := session.Participants[userID]; !exists {
+		return nil, fmt.Errorf("user not in call")
+	}
+
+	// Create response
+	response := &CallResponse{
+		Call:         session.Call,
+		Participants: cs.buildParticipantResponses(session),
+		TURNServers:  cs.getTURNServers(),
+		IceServers:   cs.config.GetTURNServers(),
+		SignalingURL: cs.getSignalingURL(),
+	}
+
+	if session.Room != nil {
+		response.Room = &CallRoomInfo{
+			RoomID:      session.Room.ID,
+			MaxPeers:    session.Room.MaxPeers,
+			ActivePeers: session.Room.PeerCount,
+			IsRecording: session.IsRecording,
 		}
-		return nil, fmt.Errorf("failed to find active call: %w", err)
 	}
 
-	return &call, nil
+	return response, nil
 }
 
 // StartRecording starts call recording
-func (s *CallService) StartRecording(callID primitive.ObjectID, userID primitive.ObjectID) error {
-	call, err := s.getCall(callID)
-	if err != nil {
-		return fmt.Errorf("call not found: %w", err)
+func (cs *CallService) StartRecording(callID primitive.ObjectID, userID primitive.ObjectID) error {
+	// Get active call session
+	cs.callsMutex.RLock()
+	session, exists := cs.activeCalls[callID]
+	cs.callsMutex.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("call not found or not active")
 	}
 
-	// Check permissions
-	if !s.canRecordCall(call, userID) {
-		return fmt.Errorf("recording not allowed")
+	session.mutex.Lock()
+	defer session.mutex.Unlock()
+
+	// Check if user can start recording
+	if !session.Call.Settings.RecordingEnabled {
+		return fmt.Errorf("recording not enabled for this call")
 	}
 
-	// Start recording
-	call.StartRecording(userID)
-
-	// Update call
-	if err := s.updateCall(call); err != nil {
-		return fmt.Errorf("failed to update call: %w", err)
+	// Check if user is call initiator or admin
+	if session.Call.InitiatorID != userID {
+		// Check if user is admin in group call
+		canRecord := false
+		for _, p := range session.Call.Participants {
+			if p.UserID == userID && (p.Role == models.ParticipantRoleInitiator || p.Role == models.ParticipantRoleModerator) {
+				canRecord = true
+				break
+			}
+		}
+		if !canRecord {
+			return fmt.Errorf("insufficient permissions to start recording")
+		}
 	}
 
-	s.logCallEvent("recording_started", call, map[string]interface{}{
+	// Start recording in room
+	if session.Room != nil {
+		if err := session.Room.StartRecording(userID); err != nil {
+			return fmt.Errorf("failed to start recording: %w", err)
+		}
+	}
+
+	// Update session
+	session.IsRecording = true
+
+	// Update call in database
+	cs.updateCallRecording(callID, true, userID)
+
+	// Notify all participants
+	go cs.notifyAllParticipants(session.Call, "recording_started", map[string]interface{}{
 		"started_by": userID.Hex(),
+		"started_at": time.Now(),
+	})
+
+	logger.LogUserAction(userID.Hex(), "recording_started", "call_service", map[string]interface{}{
+		"call_id": callID.Hex(),
 	})
 
 	return nil
 }
 
 // StopRecording stops call recording
-func (s *CallService) StopRecording(callID primitive.ObjectID, userID primitive.ObjectID) error {
-	call, err := s.getCall(callID)
-	if err != nil {
-		return fmt.Errorf("call not found: %w", err)
+func (cs *CallService) StopRecording(callID primitive.ObjectID, userID primitive.ObjectID) error {
+	// Get active call session
+	cs.callsMutex.RLock()
+	session, exists := cs.activeCalls[callID]
+	cs.callsMutex.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("call not found or not active")
 	}
 
-	// Check if recording is active
-	if call.Recording == nil || !call.Recording.IsRecording {
-		return fmt.Errorf("recording is not active")
+	session.mutex.Lock()
+	defer session.mutex.Unlock()
+
+	if !session.IsRecording {
+		return fmt.Errorf("call is not being recorded")
 	}
 
-	// Stop recording
-	call.StopRecording()
-
-	// Update call
-	if err := s.updateCall(call); err != nil {
-		return fmt.Errorf("failed to update call: %w", err)
+	// Stop recording in room
+	if session.Room != nil {
+		// The room will handle stopping recording internally
 	}
 
-	s.logCallEvent("recording_stopped", call, map[string]interface{}{
+	// Update session
+	session.IsRecording = false
+
+	// Update call in database
+	cs.updateCallRecording(callID, false, primitive.NilObjectID)
+
+	// Notify all participants
+	go cs.notifyAllParticipants(session.Call, "recording_stopped", map[string]interface{}{
 		"stopped_by": userID.Hex(),
-		"duration":   call.Recording.Duration,
+		"stopped_at": time.Now(),
+	})
+
+	logger.LogUserAction(userID.Hex(), "recording_stopped", "call_service", map[string]interface{}{
+		"call_id": callID.Hex(),
 	})
 
 	return nil
 }
 
-// Helper Methods
+// UpdateMediaState updates a participant's media state
+func (cs *CallService) UpdateMediaState(callID primitive.ObjectID, userID primitive.ObjectID, mediaState models.MediaState) error {
+	// Get active call session
+	cs.callsMutex.RLock()
+	session, exists := cs.activeCalls[callID]
+	cs.callsMutex.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("call not found or not active")
+	}
+
+	session.mutex.Lock()
+	defer session.mutex.Unlock()
+
+	// Find participant
+	participantInfo, exists := session.Participants[userID]
+	if !exists {
+		return fmt.Errorf("user not in call")
+	}
+
+	// Update media state
+	participantInfo.MediaState = mediaState
+	participantInfo.LastActivity = time.Now()
+
+	// Update in database
+	cs.updateCallParticipantMedia(callID, userID, mediaState)
+
+	// Notify other participants
+	go cs.notifyParticipantsExcept(session.Call, "media_state_changed", userID, map[string]interface{}{
+		"user_id":     userID.Hex(),
+		"media_state": mediaState,
+	})
+
+	logger.LogUserAction(userID.Hex(), "media_state_updated", "call_service", map[string]interface{}{
+		"call_id":        callID.Hex(),
+		"video_enabled":  mediaState.VideoEnabled,
+		"audio_enabled":  mediaState.AudioEnabled,
+		"screen_sharing": mediaState.ScreenSharing,
+	})
+
+	return nil
+}
+
+// UpdateQualityMetrics updates call quality metrics for a participant
+func (cs *CallService) UpdateQualityMetrics(callID primitive.ObjectID, userID primitive.ObjectID, quality *models.QualityMetrics) error {
+	// Get active call session
+	cs.callsMutex.RLock()
+	session, exists := cs.activeCalls[callID]
+	cs.callsMutex.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("call not found or not active")
+	}
+
+	session.mutex.Lock()
+	defer session.mutex.Unlock()
+
+	// Find participant
+	participantInfo, exists := session.Participants[userID]
+	if !exists {
+		return fmt.Errorf("user not in call")
+	}
+
+	// Update quality metrics
+	participantInfo.QualityMetrics = quality
+	participantInfo.LastActivity = time.Now()
+
+	// Store in session quality data
+	session.QualityData[userID] = quality
+
+	// Log quality issues if any
+	if quality.QualityScore < 3.0 {
+		logger.Warnf("Poor call quality detected for user %s in call %s: score %.2f",
+			userID.Hex(), callID.Hex(), quality.QualityScore)
+	}
+
+	return nil
+}
+
+// GetCallStatistics returns call service statistics
+func (cs *CallService) GetCallStatistics() *CallStatistics {
+	cs.callStats.mutex.RLock()
+	defer cs.callStats.mutex.RUnlock()
+
+	// Create a copy
+	stats := *cs.callStats
+	return &stats
+}
+
+// Helper methods
 
 // validateCallRequest validates call request
-func (s *CallService) validateCallRequest(request *CallRequest) error {
-	if len(request.Participants) == 0 {
-		return fmt.Errorf("participants are required")
+func (cs *CallService) validateCallRequest(req *CallRequest) error {
+	if req.InitiatorID.IsZero() {
+		return fmt.Errorf("initiator ID is required")
 	}
 
-	if len(request.Participants) > 10 { // Max 10 participants
-		return fmt.Errorf("too many participants (max 10)")
+	if len(req.ParticipantIDs) == 0 {
+		return fmt.Errorf("at least one participant is required")
 	}
 
-	if request.Type == "" {
+	if req.ChatID.IsZero() {
+		return fmt.Errorf("chat ID is required")
+	}
+
+	if req.Type == "" {
 		return fmt.Errorf("call type is required")
 	}
 
+	// Check maximum participants based on call type
+	maxParticipants := 2
+	if req.Type == models.CallTypeGroup || req.Type == models.CallTypeConference {
+		maxParticipants = 10
+	}
+
+	if len(req.ParticipantIDs) > maxParticipants {
+		return fmt.Errorf("too many participants for call type %s", req.Type)
+	}
+
 	return nil
 }
 
-// checkCallPermissions checks if user can make calls
-func (s *CallService) checkCallPermissions(userID, chatID primitive.ObjectID) error {
-	// Check if user is member of the chat
+// checkParticipantsAvailability checks if participants are available
+func (cs *CallService) checkParticipantsAvailability(participantIDs []primitive.ObjectID) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	count, err := s.collections.Chats.CountDocuments(ctx, bson.M{
-		"_id":          chatID,
-		"participants": userID,
-		"is_active":    true,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to check chat access: %w", err)
-	}
+	// Check if any participant is already in a call
+	for _, userID := range participantIDs {
+		// Check in active calls
+		cs.callsMutex.RLock()
+		for _, session := range cs.activeCalls {
+			if _, exists := session.Participants[userID]; exists {
+				cs.callsMutex.RUnlock()
+				return fmt.Errorf("user %s is already in another call", userID.Hex())
+			}
+		}
+		cs.callsMutex.RUnlock()
 
-	if count == 0 {
-		return fmt.Errorf("user is not a member of this chat")
+		// Check if user exists and is active
+		var user models.User
+		err := cs.usersCollection.FindOne(ctx, bson.M{
+			"_id":        userID,
+			"is_active":  true,
+			"is_deleted": false,
+		}).Decode(&user)
+		if err != nil {
+			return fmt.Errorf("user %s not found or inactive", userID.Hex())
+		}
 	}
 
 	return nil
 }
 
-// checkParticipantAvailability checks if participants are available
-func (s *CallService) checkParticipantAvailability(participants []primitive.ObjectID) ([]primitive.ObjectID, error) {
-	var unavailable []primitive.ObjectID
+// createCall creates a new call in database
+func (cs *CallService) createCall(req *CallRequest) (*models.Call, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
-	for _, participantID := range participants {
-		// Check if user has an active call
-		activeCall, err := s.GetActiveCall(participantID)
-		if err != nil {
-			continue // Ignore errors, assume available
+	// Create call model
+	call := &models.Call{
+		Type:        req.Type,
+		Status:      models.CallStatusInitiating,
+		InitiatorID: req.InitiatorID,
+		ChatID:      req.ChatID,
+	}
+
+	// Set default settings if not provided
+	if req.Settings == nil {
+		call.Settings = models.CallSettings{
+			MaxParticipants:   10,
+			RequirePermission: false,
+			AutoAccept:        false,
+			RecordingEnabled:  false,
+			MaxVideoBitrate:   2000000,
+			MaxAudioBitrate:   128000,
+			AdaptiveQuality:   true,
 		}
+	} else {
+		call.Settings = *req.Settings
+	}
 
-		if activeCall != nil {
-			unavailable = append(unavailable, participantID)
+	// Add participants
+	for _, participantID := range req.ParticipantIDs {
+		participant := models.CallParticipant{
+			UserID: participantID,
+			Status: models.ParticipantStatusInvited,
+			Role:   models.ParticipantRoleParticipant,
+			MediaState: models.MediaState{
+				VideoEnabled: req.VideoEnabled,
+				AudioEnabled: req.AudioEnabled,
+			},
+			DeviceInfo: req.DeviceInfo,
+		}
+		call.Participants = append(call.Participants, participant)
+	}
+
+	// Set initiator as initiator role
+	if len(call.Participants) > 0 {
+		for i := range call.Participants {
+			if call.Participants[i].UserID == req.InitiatorID {
+				call.Participants[i].Role = models.ParticipantRoleInitiator
+				break
+			}
 		}
 	}
 
-	return unavailable, nil
+	// Set before create
+	call.BeforeCreate()
+
+	// Insert into database
+	result, err := cs.callsCollection.InsertOne(ctx, call)
+	if err != nil {
+		return nil, fmt.Errorf("failed to insert call: %w", err)
+	}
+
+	call.ID = result.InsertedID.(primitive.ObjectID)
+	return call, nil
 }
 
-// allParticipantsRejected checks if all participants rejected the call
-func (s *CallService) allParticipantsRejected(call *models.Call) bool {
+// createCallSession creates a call session with WebRTC room
+func (cs *CallService) createCallSession(call *models.Call) (*CallSession, error) {
+	// Create WebRTC room configuration
+	roomConfig := webrtc.DefaultRoomConfig(call.Type)
+	roomConfig.MaxParticipants = call.Settings.MaxParticipants
+	roomConfig.VideoEnabled = call.Type == models.CallTypeVideo || call.Type == models.CallTypeGroup
+	roomConfig.AudioEnabled = true
+	roomConfig.EnableRecording = call.Settings.RecordingEnabled
+
+	// Create WebRTC room
+	room := webrtc.NewRoom(call.ID, call.ChatID, call.Type, roomConfig, cs.hub)
+
+	// Create session
+	session := &CallSession{
+		Call:         call,
+		Room:         room,
+		Participants: make(map[primitive.ObjectID]*CallParticipantInfo),
+		StartTime:    time.Now(),
+		IsActive:     true,
+		IsRecording:  false,
+		QualityData:  make(map[primitive.ObjectID]*models.QualityMetrics),
+		Events:       []CallEvent{},
+	}
+
+	// Add participants to session
 	for _, participant := range call.Participants {
+		participantInfo := &CallParticipantInfo{
+			UserID:         participant.UserID,
+			Status:         participant.Status,
+			MediaState:     participant.MediaState,
+			DeviceInfo:     participant.DeviceInfo,
+			QualityMetrics: &models.QualityMetrics{},
+			LastActivity:   time.Now(),
+		}
+		session.Participants[participant.UserID] = participantInfo
+	}
+
+	return session, nil
+}
+
+// notifyParticipants sends notifications to all call participants
+func (cs *CallService) notifyParticipants(call *models.Call, eventType string) {
+	for _, participant := range call.Participants {
+		if participant.UserID == call.InitiatorID {
+			continue // Don't notify initiator
+		}
+
+		// Send WebSocket notification
+		if cs.hub != nil {
+			data := map[string]interface{}{
+				"call_id":      call.ID.Hex(),
+				"initiator_id": call.InitiatorID.Hex(),
+				"call_type":    call.Type,
+				"chat_id":      call.ChatID.Hex(),
+			}
+			cs.hub.SendToUser(participant.UserID, eventType, data)
+		}
+
+		// Send push notification
+		if cs.pushService != nil {
+			go func(userID primitive.ObjectID) {
+				initiatorName := cs.getUserName(call.InitiatorID)
+				message := fmt.Sprintf("Incoming %s call from %s", call.Type, initiatorName)
+
+				err := cs.pushService.SendCallNotification(userID, call.ID, message, map[string]interface{}{
+					"call_id":   call.ID.Hex(),
+					"call_type": call.Type,
+					"action":    "incoming_call",
+				})
+				if err != nil {
+					logger.Errorf("Failed to send push notification: %v", err)
+				}
+			}(participant.UserID)
+		}
+	}
+}
+
+// notifyParticipantsExcept sends notifications to all participants except one
+func (cs *CallService) notifyParticipantsExcept(call *models.Call, eventType string, excludeUserID primitive.ObjectID, data map[string]interface{}) {
+	for _, participant := range call.Participants {
+		if participant.UserID == excludeUserID {
+			continue
+		}
+
+		if cs.hub != nil {
+			cs.hub.SendToUser(participant.UserID, eventType, data)
+		}
+	}
+}
+
+// notifyAllParticipants sends notifications to all participants
+func (cs *CallService) notifyAllParticipants(call *models.Call, eventType string, data map[string]interface{}) {
+	for _, participant := range call.Participants {
+		if cs.hub != nil {
+			cs.hub.SendToUser(participant.UserID, eventType, data)
+		}
+	}
+}
+
+// createCallMessage creates a system message for the call
+func (cs *CallService) createCallMessage(call *models.Call, messageType string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var content string
+	switch messageType {
+	case "call_initiated":
+		content = fmt.Sprintf("%s call started", call.Type)
+	case "call_ended":
+		duration := time.Duration(call.Duration) * time.Second
+		content = fmt.Sprintf("Call ended • %s", cs.formatDuration(duration))
+	default:
+		content = "Call activity"
+	}
+
+	message := &models.Message{
+		ChatID:   call.ChatID,
+		SenderID: call.InitiatorID,
+		Type:     models.MessageTypeCall,
+		Content:  content,
+		Status:   models.MessageStatusSent,
+		Metadata: models.MessageMetadata{
+			CallData: &models.CallMessageData{
+				CallType:     string(call.Type),
+				Duration:     int(call.Duration),
+				Status:       "completed",
+				Participants: []primitive.ObjectID{call.InitiatorID},
+			},
+		},
+	}
+
+	message.BeforeCreate()
+
+	_, err := cs.messagesCollection.InsertOne(ctx, message)
+	if err != nil {
+		logger.Errorf("Failed to create call message: %v", err)
+	}
+}
+
+// Database helper methods
+
+// updateCallStatus updates call status in database
+func (cs *CallService) updateCallStatus(callID primitive.ObjectID, status models.CallStatus) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	update := bson.M{
+		"$set": bson.M{
+			"status":     status,
+			"updated_at": time.Now(),
+		},
+	}
+
+	_, err := cs.callsCollection.UpdateOne(ctx, bson.M{"_id": callID}, update)
+	return err
+}
+
+// updateCallParticipant updates participant status
+func (cs *CallService) updateCallParticipant(callID primitive.ObjectID, userID primitive.ObjectID, status models.ParticipantStatus) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	update := bson.M{
+		"$set": bson.M{
+			"participants.$.status":     status,
+			"participants.$.updated_at": time.Now(),
+		},
+	}
+
+	filter := bson.M{
+		"_id":                  callID,
+		"participants.user_id": userID,
+	}
+
+	_, err := cs.callsCollection.UpdateOne(ctx, filter, update)
+	return err
+}
+
+// updateCallParticipantMedia updates participant media state
+func (cs *CallService) updateCallParticipantMedia(callID primitive.ObjectID, userID primitive.ObjectID, mediaState models.MediaState) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	update := bson.M{
+		"$set": bson.M{
+			"participants.$.media_state": mediaState,
+			"participants.$.updated_at":  time.Now(),
+		},
+	}
+
+	filter := bson.M{
+		"_id":                  callID,
+		"participants.user_id": userID,
+	}
+
+	_, err := cs.callsCollection.UpdateOne(ctx, filter, update)
+	return err
+}
+
+// updateCallRecording updates recording status
+func (cs *CallService) updateCallRecording(callID primitive.ObjectID, isRecording bool, recordedBy primitive.ObjectID) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	updateDoc := bson.M{
+		"recording.is_recording": isRecording,
+		"updated_at":             time.Now(),
+	}
+
+	if isRecording {
+		now := time.Now()
+		updateDoc["recording.started_at"] = &now
+		updateDoc["recording.recorded_by"] = recordedBy
+	} else {
+		now := time.Now()
+		updateDoc["recording.ended_at"] = &now
+	}
+
+	update := bson.M{"$set": updateDoc}
+
+	_, err := cs.callsCollection.UpdateOne(ctx, bson.M{"_id": callID}, update)
+	return err
+}
+
+// saveCallToDatabase saves call to database
+func (cs *CallService) saveCallToDatabase(call *models.Call) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	call.BeforeUpdate()
+
+	filter := bson.M{"_id": call.ID}
+	update := bson.M{"$set": call}
+
+	_, err := cs.callsCollection.UpdateOne(ctx, filter, update)
+	return err
+}
+
+// deleteCall deletes a call from database
+func (cs *CallService) deleteCall(callID primitive.ObjectID) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err := cs.callsCollection.DeleteOne(ctx, bson.M{"_id": callID})
+	return err
+}
+
+// endCallInDatabase ends call in database only
+func (cs *CallService) endCallInDatabase(callID primitive.ObjectID, endedBy primitive.ObjectID, reason models.EndReason) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	now := time.Now()
+	update := bson.M{
+		"$set": bson.M{
+			"status":     models.CallStatusEnded,
+			"ended_at":   &now,
+			"ended_by":   &endedBy,
+			"end_reason": reason,
+			"updated_at": now,
+		},
+	}
+
+	_, err := cs.callsCollection.UpdateOne(ctx, bson.M{"_id": callID}, update)
+	return err
+}
+
+// Utility methods
+
+// buildParticipantResponses builds participant response data
+func (cs *CallService) buildParticipantResponses(session *CallSession) []CallParticipantResponse {
+	responses := make([]CallParticipantResponse, 0, len(session.Participants))
+
+	for userID, participantInfo := range session.Participants {
+		userInfo := cs.getUserInfo(userID)
+
+		response := CallParticipantResponse{
+			UserID:     userID,
+			UserInfo:   userInfo,
+			Status:     participantInfo.Status,
+			JoinedAt:   participantInfo.JoinedAt,
+			MediaState: participantInfo.MediaState,
+			DeviceInfo: participantInfo.DeviceInfo,
+			Quality:    participantInfo.QualityMetrics,
+		}
+		responses = append(responses, response)
+	}
+
+	return responses
+}
+
+// getUserInfo gets user public info
+func (cs *CallService) getUserInfo(userID primitive.ObjectID) models.UserPublicInfo {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	var user models.User
+	err := cs.usersCollection.FindOne(ctx, bson.M{"_id": userID}).Decode(&user)
+	if err != nil {
+		return models.UserPublicInfo{
+			ID:   userID,
+			Name: "Unknown User",
+		}
+	}
+
+	return user.GetPublicInfo(userID) // Self info
+}
+
+// getUserName gets user name
+func (cs *CallService) getUserName(userID primitive.ObjectID) string {
+	userInfo := cs.getUserInfo(userID)
+	return userInfo.Name
+}
+
+// getTURNServers gets TURN servers configuration
+func (cs *CallService) getTURNServers() []models.TURNServer {
+	servers := []models.TURNServer{}
+
+	if cs.config.COTURNConfig.Host != "" {
+		server := models.TURNServer{
+			URLs: []string{
+				fmt.Sprintf("turn:%s:%d", cs.config.COTURNConfig.Host, cs.config.COTURNConfig.Port),
+				fmt.Sprintf("stun:%s:%d", cs.config.COTURNConfig.Host, cs.config.COTURNConfig.Port),
+			},
+			Username:   cs.config.COTURNConfig.Username,
+			Credential: cs.config.COTURNConfig.Password,
+		}
+		servers = append(servers, server)
+	}
+
+	// Add public STUN servers as fallback
+	servers = append(servers, models.TURNServer{
+		URLs: []string{"stun:stun.l.google.com:19302"},
+	})
+
+	return servers
+}
+
+// getSignalingURL gets signaling server URL
+func (cs *CallService) getSignalingURL() string {
+	return "/api/webrtc/signaling" // WebSocket endpoint
+}
+
+// areAllParticipantsRejected checks if all participants rejected the call
+func (cs *CallService) areAllParticipantsRejected(session *CallSession) bool {
+	for _, participant := range session.Participants {
 		if participant.Status != models.ParticipantStatusRejected &&
 			participant.Status != models.ParticipantStatusMissed {
 			return false
@@ -732,370 +1358,243 @@ func (s *CallService) allParticipantsRejected(call *models.Call) bool {
 	return true
 }
 
-// getICEServers gets ICE servers configuration
-func (s *CallService) getICEServers() *ICEServers {
-	iceServers := &ICEServers{
-		STUNServers: []STUNServer{
-			{URL: "stun:stun.l.google.com:19302"},
-			{URL: "stun:stun1.l.google.com:19302"},
+// formatDuration formats duration for display
+func (cs *CallService) formatDuration(duration time.Duration) string {
+	if duration < time.Minute {
+		return fmt.Sprintf("%d sec", int(duration.Seconds()))
+	}
+	minutes := int(duration.Minutes())
+	seconds := int(duration.Seconds()) % 60
+	return fmt.Sprintf("%d:%02d", minutes, seconds)
+}
+
+// Background processes
+
+// setCallTimeout sets a timeout for call
+func (cs *CallService) setCallTimeout(callID primitive.ObjectID, duration time.Duration) {
+	cs.timeoutsMutex.Lock()
+	defer cs.timeoutsMutex.Unlock()
+
+	// Clear existing timeout
+	if timer, exists := cs.callTimeouts[callID]; exists {
+		timer.Stop()
+	}
+
+	// Set new timeout
+	timer := time.AfterFunc(duration, func() {
+		cs.handleCallTimeout(callID)
+	})
+	cs.callTimeouts[callID] = timer
+}
+
+// clearCallTimeout clears call timeout
+func (cs *CallService) clearCallTimeout(callID primitive.ObjectID) {
+	cs.timeoutsMutex.Lock()
+	defer cs.timeoutsMutex.Unlock()
+
+	if timer, exists := cs.callTimeouts[callID]; exists {
+		timer.Stop()
+		delete(cs.callTimeouts, callID)
+	}
+}
+
+// handleCallTimeout handles call timeout
+func (cs *CallService) handleCallTimeout(callID primitive.ObjectID) {
+	logger.Warnf("Call %s timed out", callID.Hex())
+
+	// End call due to timeout
+	cs.endCall(callID, primitive.NilObjectID, models.EndReasonTimeout)
+
+	// Clear timeout
+	cs.clearCallTimeout(callID)
+}
+
+// statsCollector collects call statistics
+func (cs *CallService) statsCollector() {
+	defer cs.wg.Done()
+
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			cs.collectStatistics()
+		case <-cs.ctx.Done():
+			return
+		}
+	}
+}
+
+// collectStatistics collects and updates statistics
+func (cs *CallService) collectStatistics() {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	cs.callStats.mutex.Lock()
+	defer cs.callStats.mutex.Unlock()
+
+	// Count total calls
+	total, _ := cs.callsCollection.CountDocuments(ctx, bson.M{})
+	cs.callStats.TotalCalls = total
+
+	// Count active calls
+	cs.callsMutex.RLock()
+	cs.callStats.ActiveCalls = len(cs.activeCalls)
+	cs.callsMutex.RUnlock()
+
+	// Count calls today
+	today := time.Now().Truncate(24 * time.Hour)
+	todayFilter := bson.M{
+		"initiated_at": bson.M{
+			"$gte": today,
 		},
-		TURNServers: []TURNServer{
-			{
-				URLs: []string{
-					fmt.Sprintf("turn:%s:%d", s.config.COTURNConfig.Host, s.config.COTURNConfig.Port),
-				},
-				Username:   s.config.COTURNConfig.Username,
-				Credential: s.config.COTURNConfig.Password,
-			},
-		},
+	}
+	callsToday, _ := cs.callsCollection.CountDocuments(ctx, todayFilter)
+	cs.callStats.CallsToday = callsToday
+
+	// Calculate average call duration
+	pipeline := []bson.M{
+		{"$match": bson.M{"status": models.CallStatusEnded, "duration": bson.M{"$gt": 0}}},
+		{"$group": bson.M{
+			"_id":          nil,
+			"avg_duration": bson.M{"$avg": "$duration"},
+		}},
 	}
 
-	return iceServers
-}
-
-// sendCallNotifications sends notifications for call events
-func (s *CallService) sendCallNotifications(call *models.Call, eventType string) {
-	if s.pushService == nil {
-		return
-	}
-
-	// Get initiator user
-	initiator, err := s.getUserByID(call.InitiatorID)
-	if err != nil {
-		logger.Errorf("Failed to get initiator user: %v", err)
-		return
-	}
-
-	// Send notifications to participants
-	for _, participant := range call.Participants {
-		if participant.UserID == call.InitiatorID {
-			continue // Don't notify initiator
-		}
-
-		recipient, err := s.getUserByID(participant.UserID)
-		if err != nil {
-			logger.Errorf("Failed to get recipient user: %v", err)
-			continue
-		}
-
-		switch eventType {
-		case "incoming_call":
-			s.pushService.SendCallNotification(initiator, recipient, call)
-		case "call_accepted", "call_rejected", "call_ended":
-			// These might be handled differently or not send push notifications
-		}
-	}
-}
-
-// canRecordCall checks if user can record the call
-func (s *CallService) canRecordCall(call *models.Call, userID primitive.ObjectID) bool {
-	// Only initiator or admin can start recording
-	if call.InitiatorID == userID {
-		return true
-	}
-
-	// Check if user is admin of the group (if group call)
-	// This would require checking group permissions
-	return false
-}
-
-// getConnectedParticipants gets list of connected participants
-func (s *CallService) getConnectedParticipants(session *CallSession) []*SessionParticipant {
-	var connected []*SessionParticipant
-	for _, participant := range session.Participants {
-		if participant.Status == "connected" {
-			connected = append(connected, participant)
-		}
-	}
-	return connected
-}
-
-// forwardSignalingMessage forwards signaling message to target participant
-func (s *CallService) forwardSignalingMessage(session *CallSession, message *SignalingMessage) error {
-	// This would typically use WebSocket or other real-time communication
-	// to forward the message to the target participant
-	logger.Debugf("Forwarding signaling message: %s -> %s", message.FromUserID, message.ToUserID)
-	return nil
-}
-
-// handlePing handles ping message for connection keep-alive
-func (s *CallService) handlePing(session *CallSession, message *SignalingMessage) error {
-	// Update last ping time for the participant
-	for _, participant := range session.Participants {
-		if participant.UserID.Hex() == message.FromUserID {
-			participant.LastPingAt = time.Now()
-			break
+	cursor, err := cs.callsCollection.Aggregate(ctx, pipeline)
+	if err == nil {
+		defer cursor.Close(ctx)
+		if cursor.Next(ctx) {
+			var result struct {
+				AvgDuration float64 `bson:"avg_duration"`
+			}
+			if err := cursor.Decode(&result); err == nil {
+				cs.callStats.AverageCallDuration = time.Duration(result.AvgDuration) * time.Second
+			}
 		}
 	}
 
-	session.UpdatedAt = time.Now()
-	return s.saveCallSession(session)
+	cs.callStats.LastUpdated = time.Now()
 }
 
-// processCallAnalytics processes call for analytics
-func (s *CallService) processCallAnalytics(call *models.Call) {
-	// Calculate call metrics
-	call.Analytics.TotalParticipantMinutes = int(call.Duration/60) * len(call.Participants)
-	call.Analytics.PeakParticipants = len(call.GetConnectedParticipants())
+// callTimeoutManager manages call timeouts
+func (cs *CallService) callTimeoutManager() {
+	defer cs.wg.Done()
 
-	// Update feature usage
-	if call.Features.VideoCall {
-		call.Analytics.FeaturesUsed = append(call.Analytics.FeaturesUsed, "video")
-	}
-	if call.Features.ScreenShare {
-		call.Analytics.FeaturesUsed = append(call.Analytics.FeaturesUsed, "screen_share")
-	}
-	if call.Features.Recording {
-		call.Analytics.FeaturesUsed = append(call.Analytics.FeaturesUsed, "recording")
-	}
-
-	// Save analytics
-	s.updateCall(call)
-}
-
-// Database Operations
-
-// saveCall saves call to database
-func (s *CallService) saveCall(call *models.Call) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	result, err := s.collections.Calls.InsertOne(ctx, call)
-	if err != nil {
-		return err
-	}
-
-	call.ID = result.InsertedID.(primitive.ObjectID)
-	return nil
-}
-
-// getCall gets call from database
-func (s *CallService) getCall(callID primitive.ObjectID) (*models.Call, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	var call models.Call
-	err := s.collections.Calls.FindOne(ctx, bson.M{"_id": callID}).Decode(&call)
-	if err != nil {
-		if err == mongo.ErrNoDocuments {
-			return nil, fmt.Errorf("call not found")
-		}
-		return nil, err
-	}
-
-	return &call, nil
-}
-
-// updateCall updates call in database
-func (s *CallService) updateCall(call *models.Call) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	call.BeforeUpdate()
-	_, err := s.collections.Calls.ReplaceOne(ctx, bson.M{"_id": call.ID}, call)
-	return err
-}
-
-// getUserByID gets user by ID
-func (s *CallService) getUserByID(userID primitive.ObjectID) (*models.User, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	var user models.User
-	err := s.collections.Users.FindOne(ctx, bson.M{"_id": userID}).Decode(&user)
-	if err != nil {
-		return nil, err
-	}
-
-	return &user, nil
-}
-
-// Redis Operations
-
-// saveCallSession saves call session to Redis
-func (s *CallService) saveCallSession(session *CallSession) error {
-	if s.redisClient == nil {
-		return nil
-	}
-
-	key := fmt.Sprintf("call_session:%s", session.CallID.Hex())
-	return s.redisClient.SetEX(key, session, 4*time.Hour)
-}
-
-// getCallSession gets call session from Redis
-func (s *CallService) getCallSession(callID primitive.ObjectID) (*CallSession, error) {
-	if s.redisClient == nil {
-		return nil, fmt.Errorf("Redis not available")
-	}
-
-	key := fmt.Sprintf("call_session:%s", callID.Hex())
-	var session CallSession
-	if err := s.redisClient.GetJSON(key, &session); err != nil {
-		return nil, err
-	}
-
-	return &session, nil
-}
-
-// deleteCallSession deletes call session from Redis
-func (s *CallService) deleteCallSession(callID primitive.ObjectID) error {
-	if s.redisClient == nil {
-		return nil
-	}
-
-	key := fmt.Sprintf("call_session:%s", callID.Hex())
-	return s.redisClient.Delete(key)
-}
-
-// Background Tasks
-
-// cleanupStaleConnections cleans up stale connections
-func (s *CallService) cleanupStaleConnections() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		if s.redisClient == nil {
-			continue
-		}
-
-		// Get all call sessions
-		pattern := "call_session:*"
-		keys, err := s.redisClient.Scan(pattern)
-		if err != nil {
-			logger.Errorf("Failed to scan call sessions: %v", err)
-			continue
-		}
-
-		for _, key := range keys {
-			var session CallSession
-			if err := s.redisClient.GetJSON(key, &session); err != nil {
-				continue
-			}
-
-			// Check for stale participants
-			now := time.Now()
-			staleThreshold := 60 * time.Second
-
-			for connectionID, participant := range session.Participants {
-				if now.Sub(participant.LastPingAt) > staleThreshold {
-					logger.Infof("Removing stale participant: %s from call %s",
-						participant.UserID.Hex(), session.CallID.Hex())
-
-					delete(session.Participants, connectionID)
-					session.UpdatedAt = now
-				}
-			}
-
-			// Remove session if no participants left
-			if len(session.Participants) == 0 {
-				logger.Infof("Removing empty call session: %s", session.CallID.Hex())
-				s.redisClient.Delete(key)
-
-				// End the call
-				if call, err := s.getCall(session.CallID); err == nil {
-					call.EndCall(primitive.NilObjectID, models.EndReasonTimeout)
-					s.updateCall(call)
-				}
-			} else {
-				// Update session
-				s.redisClient.SetEX(key, &session, 4*time.Hour)
-			}
+	for {
+		select {
+		case <-ticker.C:
+			cs.checkStaleCall()
+		case <-cs.ctx.Done():
+			return
 		}
 	}
 }
 
-// updateCallMetrics updates call metrics
-func (s *CallService) updateCallMetrics() {
-	ticker := time.NewTicker(5 * time.Minute)
+// checkStaleCall checks for stale calls and cleans them up
+func (cs *CallService) checkStaleCall() {
+	cs.callsMutex.RLock()
+	staleCalls := make([]primitive.ObjectID, 0)
+
+	for callID, session := range cs.activeCalls {
+		// Check if call has been active too long without progress
+		if time.Since(session.StartTime) > 10*time.Minute {
+			if session.Call.Status == models.CallStatusInitiating ||
+				session.Call.Status == models.CallStatusRinging {
+				staleCalls = append(staleCalls, callID)
+			}
+		}
+	}
+	cs.callsMutex.RUnlock()
+
+	// End stale calls
+	for _, callID := range staleCalls {
+		logger.Warnf("Ending stale call %s", callID.Hex())
+		cs.endCall(callID, primitive.NilObjectID, models.EndReasonTimeout)
+	}
+}
+
+// qualityMonitor monitors call quality
+func (cs *CallService) qualityMonitor() {
+	defer cs.wg.Done()
+
+	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		logger.Debug("Updating call metrics")
-
-		// Update active call metrics
-		if s.redisClient != nil {
-			activeCalls := 0
-			activeParticipants := 0
-
-			pattern := "call_session:*"
-			keys, err := s.redisClient.Scan(pattern)
-			if err == nil {
-				activeCalls = len(keys)
-
-				for _, key := range keys {
-					var session CallSession
-					if err := s.redisClient.GetJSON(key, &session); err == nil {
-						activeParticipants += len(s.getConnectedParticipants(&session))
-					}
-				}
-			}
-
-			// Store metrics in Redis
-			metricsKey := "call_metrics"
-			metrics := map[string]interface{}{
-				"active_calls":        activeCalls,
-				"active_participants": activeParticipants,
-				"last_updated":        time.Now(),
-			}
-			s.redisClient.SetEX(metricsKey, metrics, 10*time.Minute)
+	for {
+		select {
+		case <-ticker.C:
+			cs.monitorCallQuality()
+		case <-cs.ctx.Done():
+			return
 		}
 	}
 }
 
-// Logging
+// monitorCallQuality monitors quality of active calls
+func (cs *CallService) monitorCallQuality() {
+	cs.callsMutex.RLock()
+	defer cs.callsMutex.RUnlock()
 
-// logCallEvent logs call-related events
-func (s *CallService) logCallEvent(event string, call *models.Call, metadata map[string]interface{}) {
-	fields := map[string]interface{}{
-		"event": event,
-		"type":  "call_event",
+	for callID, session := range cs.activeCalls {
+		session.mutex.RLock()
+
+		// Check quality metrics for each participant
+		for userID, quality := range session.QualityData {
+			if quality.QualityScore < 2.0 { // Poor quality threshold
+				logger.Warnf("Poor call quality detected in call %s for user %s: score %.2f",
+					callID.Hex(), userID.Hex(), quality.QualityScore)
+
+				// Could implement automatic quality adjustment here
+			}
+		}
+
+		session.mutex.RUnlock()
 	}
-
-	if call != nil {
-		fields["call_id"] = call.ID.Hex()
-		fields["call_type"] = string(call.Type)
-		fields["call_status"] = string(call.Status)
-		fields["initiator_id"] = call.InitiatorID.Hex()
-		fields["participant_count"] = len(call.Participants)
-	}
-
-	for k, v := range metadata {
-		fields[k] = v
-	}
-
-	logger.WithFields(fields).Info("Call event")
 }
 
-// Utility Functions
+// updateCallStats updates call statistics
+func (cs *CallService) updateCallStats(eventType string) {
+	cs.callStats.mutex.Lock()
+	defer cs.callStats.mutex.Unlock()
 
-// GetCallMetrics gets current call metrics
-func (s *CallService) GetCallMetrics() (map[string]interface{}, error) {
-	if s.redisClient == nil {
-		return map[string]interface{}{}, nil
+	switch eventType {
+	case "initiated":
+		cs.callStats.CallsToday++
+	case "ended":
+		// Update success rate calculation could be added here
 	}
 
-	var metrics map[string]interface{}
-	if err := s.redisClient.GetJSON("call_metrics", &metrics); err != nil {
-		return map[string]interface{}{}, nil
+	cs.callStats.LastUpdated = time.Now()
+}
+
+// Close gracefully shuts down the call service
+func (cs *CallService) Close() error {
+	logger.Info("Shutting down Call Service...")
+
+	// Cancel context and wait for goroutines
+	cs.cancel()
+	cs.wg.Wait()
+
+	// End all active calls
+	cs.callsMutex.Lock()
+	for callID := range cs.activeCalls {
+		cs.endCall(callID, primitive.NilObjectID, models.EndReasonServerError)
 	}
+	cs.callsMutex.Unlock()
 
-	return metrics, nil
-}
+	// Clear all timeouts
+	cs.timeoutsMutex.Lock()
+	for _, timer := range cs.callTimeouts {
+		timer.Stop()
+	}
+	cs.callTimeouts = make(map[primitive.ObjectID]*time.Timer)
+	cs.timeoutsMutex.Unlock()
 
-// IsUserInCall checks if user is currently in a call
-func (s *CallService) IsUserInCall(userID primitive.ObjectID) bool {
-	activeCall, err := s.GetActiveCall(userID)
-	return err == nil && activeCall != nil
-}
-
-// Global service instance
-var globalCallService *CallService
-
-func GetCallService() *CallService {
-	return globalCallService
-}
-
-func SetCallService(service *CallService) {
-	globalCallService = service
+	logger.Info("Call Service shutdown complete")
+	return nil
 }

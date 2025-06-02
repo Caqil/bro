@@ -396,11 +396,16 @@ func GenerateSecureKey(length int) (string, error) {
 // GenerateRandomString generates a random string of specified length
 func generateRandomString(length int) string {
 	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	b := make([]byte, length)
-	for i := range b {
-		b[i] = charset[rand.Intn(len(charset))]
+	bytes := make([]byte, length)
+	if _, err := rand.Read(bytes); err != nil {
+		// Fallback to timestamp-based if crypto/rand fails
+		return fmt.Sprintf("%d", time.Now().UnixNano())
 	}
-	return string(b)
+
+	for i, b := range bytes {
+		bytes[i] = charset[b%byte(len(charset))]
+	}
+	return string(bytes)
 }
 
 // GenerateAPIKey generates a secure API key
@@ -508,7 +513,15 @@ func HashSessionToken(token string) string {
 
 // GenerateOTP generates a 6-digit OTP
 func GenerateOTP() string {
-	return fmt.Sprintf("%06d", rand.Intn(1000000))
+	bytes := make([]byte, 3)
+	if _, err := rand.Read(bytes); err != nil {
+		// Fallback to timestamp-based if crypto/rand fails
+		return fmt.Sprintf("%06d", time.Now().Unix()%1000000)
+	}
+
+	// Convert to 6-digit number
+	num := int(bytes[0])<<16 | int(bytes[1])<<8 | int(bytes[2])
+	return fmt.Sprintf("%06d", num%1000000)
 }
 
 // GenerateSecureOTP generates a cryptographically secure OTP
