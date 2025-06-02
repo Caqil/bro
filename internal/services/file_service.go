@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/disintegration/imaging"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -996,22 +997,20 @@ func (s *FileService) generateSingleThumbnail(fileInfo *FileInfo, size string) e
 		newWidth = int(float64(srcWidth) * float64(config.Height) / float64(srcHeight))
 	}
 
-	// Create thumbnail (simplified resizing - in production use proper image library)
-	// For now, just copy the original image as placeholder
+	// Resize the image using the imaging library
+	thumbnailImage := imaging.Resize(sourceImage, newWidth, newHeight, imaging.Lanczos)
+
+	// Create thumbnail file
 	thumbnailFile, err := os.Create(thumbnailPath)
 	if err != nil {
 		return fmt.Errorf("failed to create thumbnail file: %w", err)
 	}
 	defer thumbnailFile.Close()
 
-	// Reset source file
-	sourceFile.Seek(0, 0)
-
-	// For demonstration, just copy the file
-	// In production, use proper image resizing library like imaging or graphics-go
-	_, err = io.Copy(thumbnailFile, sourceFile)
+	// Save the resized image as JPEG
+	err = imaging.Save(thumbnailImage, thumbnailPath, imaging.JPEGQuality(90))
 	if err != nil {
-		return fmt.Errorf("failed to write thumbnail: %w", err)
+		return fmt.Errorf("failed to save thumbnail: %w", err)
 	}
 
 	return nil
