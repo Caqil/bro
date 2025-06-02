@@ -19,15 +19,15 @@ import (
 	"github.com/googollee/go-socket.io/engineio/transport/websocket"
 	"github.com/joho/godotenv"
 
-	"chat-app/internal/config"
-	"chat-app/internal/handlers"
-	"chat-app/internal/middleware"
-	"chat-app/internal/services"
-	"chat-app/internal/webrtc"
-	"chat-app/internal/websocket"
-	"chat-app/pkg/database"
-	"chat-app/pkg/logger"
-	"chat-app/pkg/redis"
+	"bro/internal/config"
+	"bro/internal/handlers"
+	"bro/internal/middleware"
+	"bro/internal/services"
+	"bro/internal/webrtc"
+	"bro/internal/websocket"
+	"bro/pkg/database"
+	"bro/pkg/logger"
+	"bro/pkg/redis"
 )
 
 func main() {
