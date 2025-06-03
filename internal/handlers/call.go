@@ -1,10 +1,8 @@
 package handlers
 
 import (
-	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -759,35 +757,6 @@ func (h *CallHandler) RegisterWebRTCRoutes(r *gin.RouterGroup, jwtSecret string)
 	}
 }
 
-// Health check endpoint for call service
-func (h *AuthHandler) HealthCheck(c *gin.Context) {
-	services := make(map[string]utils.ServiceInfo)
-
-	// Test auth service health
-	services["auth"] = utils.ServiceInfo{
-		Status:  "healthy",
-		Message: "Authentication service is operational",
-	}
-
-	services["database"] = utils.ServiceInfo{
-		Status:  "healthy",
-		Message: "Database connection is healthy",
-	}
-
-	// Parse the uptime string to time.Duration
-	uptimeStr := c.MustGet("uptime").(string)
-	uptime, err := time.ParseDuration(uptimeStr)
-	if err != nil {
-		// Handle the error appropriately, e.g., log it or return an error response
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Invalid uptime format"})
-		return
-	}
-
-	utils.HealthCheck(c, "1.0.0", services, uptime)
-}
-
-// Call quality and troubleshooting endpoints
-
 // GetCallDiagnostics returns diagnostic information for a call (admin/moderator)
 func (h *CallHandler) GetCallDiagnostics(c *gin.Context) {
 	if !middleware.IsModerator(c) {
@@ -843,12 +812,48 @@ func (h *CallHandler) sanitizeCallResponse(response interface{}) interface{} {
 
 // Helper method to get device info from headers
 func getDeviceInfoFromHeaders(c *gin.Context) models.DeviceInfo {
+	userAgent := c.GetHeader("User-Agent")
+	platform := c.GetHeader("X-Platform")
+
+	// Determine device type based on platform or user agent
+	deviceType := "desktop"
+	if platform != "" {
+		switch strings.ToLower(platform) {
+		case "ios", "android":
+			deviceType = "mobile"
+		case "ipad", "tablet":
+			deviceType = "tablet"
+		case "web", "desktop":
+			deviceType = "desktop"
+		}
+	}
+
+	// Extract browser info from User-Agent if available
+	browser := ""
+	browserVersion := ""
+	if userAgent != "" {
+		// Simple browser detection - in production you might want more sophisticated parsing
+		if strings.Contains(userAgent, "Chrome") {
+			browser = "Chrome"
+		} else if strings.Contains(userAgent, "Firefox") {
+			browser = "Firefox"
+		} else if strings.Contains(userAgent, "Safari") {
+			browser = "Safari"
+		} else if strings.Contains(userAgent, "Edge") {
+			browser = "Edge"
+		}
+	}
+
 	return models.DeviceInfo{
-		Platform:   c.GetHeader("X-Platform"),
-		DeviceID:   c.GetHeader("X-Device-ID"),
-		AppVersion: c.GetHeader("X-App-Version"),
-		UserAgent:  c.GetHeader("User-Agent"),
-		IP:         utils.GetClientIP(c),
+		Platform:            platform,
+		DeviceType:          deviceType,
+		Browser:             browser,
+		BrowserVersion:      browserVersion,
+		AppVersion:          c.GetHeader("X-App-Version"),
+		OSVersion:           c.GetHeader("X-OS-Version"),
+		SupportsVideo:       true, // Default to true, can be updated later
+		SupportsAudio:       true, // Default to true, can be updated later
+		SupportsScreenShare: true, // Default to true, can be updated later
 	}
 }
 
