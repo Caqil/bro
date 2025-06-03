@@ -36,24 +36,55 @@ func main() {
 	// Initialize logger
 	logger.Init()
 
-	// Load configuration
+	// Load configuration (still needed for other services)
 	cfg := config.Load()
 
-	// Initialize database
-	_, err := database.Connect(cfg.MongoURI)
+	// Option 1: Use direct environment-based database connection
+	// This approach reads MongoDB configuration directly from environment variables
+	_, err := database.Connect()
 	if err != nil {
 		log.Fatal("Failed to connect to MongoDB:", err)
 	}
 
+	// Option 2: Use config-based connection (backward compatibility)
+	// Uncomment this block and comment Option 1 if you prefer to use config
+	/*
+		_, err := database.ConnectWithURI(cfg.MongoURI)
+		if err != nil {
+			log.Fatal("Failed to connect to MongoDB:", err)
+		}
+	*/
+
+	// Option 3: Use custom configuration
+	// Uncomment this block and comment Option 1 if you want custom config
+	/*
+		dbConfig := &database.Config{
+			URI:             cfg.MongoURI,
+			Database:        "bro_chat",
+			MaxPoolSize:     150,        // Custom pool size
+			MinPoolSize:     10,         // Custom min pool
+			ConnectTimeout:  15 * time.Second,
+			// ... other custom settings
+		}
+		_, err := database.ConnectWithConfig(dbConfig)
+		if err != nil {
+			log.Fatal("Failed to connect to MongoDB:", err)
+		}
+	*/
+
 	// Get MongoDB database instance for services that need it
 	mongoDB := database.GetDB()
+
+	// Show connection info
+	connInfo := database.GetConnectionInfo()
+	log.Printf("Database connection info: %+v", connInfo)
 
 	// Run database migrations and seeding
 	if err := runDatabaseSetup(mongoDB, cfg.Production); err != nil {
 		log.Fatal("Failed to setup database:", err)
 	}
 
-	// Initialize Redis
+	// Initialize Redis (still uses config approach)
 	redisClient := redis.NewClient(cfg.RedisURL)
 
 	// Initialize WebSocket hub with correct parameters
@@ -92,11 +123,6 @@ func main() {
 		smsService,
 	)
 
-	// Note: ChatHandler and MessageHandler need ChatService and MessageService
-	// which don't exist yet, so we'll comment them out for now
-	// chatHandler := handlers.NewChatHandler(chatService)
-	// messageHandler := handlers.NewMessageHandler(messageService)
-
 	// Setup Gin router
 	if cfg.Production {
 		gin.SetMode(gin.ReleaseMode)
@@ -118,11 +144,6 @@ func main() {
 
 	// Rate limiting middleware
 	router.Use(middleware.RateLimit())
-
-	// Setup Socket.IO server
-	//server := setupSocketIO(hub, signalingServer, cfg)
-	// router.GET("/socket.io/*any", gin.WrapH(server))
-	// router.POST("/socket.io/*any", gin.WrapH(server))
 
 	// API routes
 	api := router.Group("/api")
@@ -147,8 +168,6 @@ func main() {
 			protected.PUT("/change-password", authHandler.ChangePassword)
 			protected.POST("/logout", authHandler.Logout)
 			protected.GET("/validate", authHandler.ValidateToken)
-
-			// Contact routes
 
 			// Group routes
 			groups := protected.Group("/groups")
@@ -252,10 +271,6 @@ func main() {
 			{
 				devices.GET("", authHandler.GetDevices)
 			}
-
-			// TODO: Add chat and message routes when services are implemented
-			// chats := protected.Group("/chats")
-			// messages := protected.Group("/messages")
 		}
 
 		// Admin routes
@@ -371,20 +386,48 @@ func main() {
 				"data":    status,
 			})
 		})
+
+		// Database info endpoint (admin only)
+		api.GET("/admin/database/info", middleware.AdminMiddleware(cfg.JWTSecret), func(c *gin.Context) {
+			info := database.GetConnectionInfo()
+			stats, err := database.GetStats()
+
+			response := gin.H{
+				"success":    true,
+				"connection": info,
+			}
+
+			if err == nil {
+				response["stats"] = stats
+			}
+
+			c.JSON(http.StatusOK, response)
+		})
 	}
 
-	// Health check endpoint
+	// Health check endpoint with enhanced database info
 	router.GET("/health", func(c *gin.Context) {
+		dbHealth := "connected"
+		if err := database.Health(); err != nil {
+			dbHealth = "disconnected"
+		}
+
+		redisHealth := "connected"
+		if err := redis.Health(); err != nil {
+			redisHealth = "disconnected"
+		}
+
 		c.JSON(http.StatusOK, gin.H{
 			"status":    "ok",
 			"timestamp": time.Now().Unix(),
 			"version":   "1.0.0",
 			"services": gin.H{
-				"database":  "connected",
-				"redis":     "connected",
+				"database":  dbHealth,
+				"redis":     redisHealth,
 				"websocket": "running",
 				"webrtc":    "running",
 			},
+			"database_info": database.GetConnectionInfo(),
 		})
 	})
 
@@ -425,6 +468,16 @@ func main() {
 	<-quit
 
 	log.Println("Shutting down server...")
+
+	// Close database connection
+	if err := database.Close(); err != nil {
+		log.Printf("Error closing database: %v", err)
+	}
+
+	// Close Redis connection
+	if redisClient := redis.GetClient(); redisClient != nil {
+		redisClient.Close()
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

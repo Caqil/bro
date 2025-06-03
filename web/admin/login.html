@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BRO Chat Admin Login</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 1rem;
+        }
+
+        .login-container {
+            background: white;
+            border-radius: 1rem;
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1);
+            overflow: hidden;
+            width: 100%;
+            max-width: 400px;
+            animation: slideUp 0.6s ease;
+        }
+
+        @keyframes slideUp {
+            from {
+                opacity: 0;
+                transform: translateY(30px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .login-header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 2rem;
+            text-align: center;
+        }
+
+        .logo {
+            font-size: 2.5rem;
+            margin-bottom: 0.5rem;
+        }
+
+        .login-header h1 {
+            font-size: 1.5rem;
+            font-weight: 600;
+            margin-bottom: 0.5rem;
+        }
+
+        .login-header p {
+            opacity: 0.9;
+            font-size: 0.9rem;
+        }
+
+        .login-form {
+            padding: 2rem;
+        }
+
+        .form-group {
+            margin-bottom: 1.5rem;
+        }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 0.5rem;
+            color: #374151;
+            font-weight: 500;
+        }
+
+        .form-group input,
+        .form-group select {
+            width: 100%;
+            padding: 0.875rem;
+            border: 1px solid #e2e8f0;
+            border-radius: 0.5rem;
+            font-size: 1rem;
+            transition: all 0.3s ease;
+            background: #f8fafc;
+        }
+
+        .form-group input:focus,
+        .form-group select:focus {
+            outline: none;
+            border-color: #667eea;
+            background: white;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+        }
+
+        .phone-input-group {
+            display: flex;
+            gap: 0.5rem;
+        }
+
+        .country-code {
+            flex: 0 0 120px;
+        }
+
+        .phone-number {
+            flex: 1;
+        }
+
+        .password-group {
+            position: relative;
+        }
+
+        .password-toggle {
+            position: absolute;
+            right: 0.875rem;
+            top: 50%;
+            transform: translateY(-50%);
+            background: none;
+            border: none;
+            color: #6b7280;
+            cursor: pointer;
+            font-size: 1rem;
+            transition: color 0.3s ease;
+        }
+
+        .password-toggle:hover {
+            color: #374151;
+        }
+
+        .login-button {
+            width: 100%;
+            padding: 0.875rem;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 0.5rem;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+        }
+
+        .login-button:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        }
+
+        .login-button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+
+        .loading-spinner {
+            width: 20px;
+            height: 20px;
+            border: 2px solid rgba(255, 255, 255, 0.3);
+            border-radius: 50%;
+            border-top-color: white;
+            animation: spin 1s ease-in-out infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .error-message {
+            background: #fee2e2;
+            color: #991b1b;
+            padding: 0.875rem;
+            border-radius: 0.5rem;
+            margin-bottom: 1rem;
+            display: none;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 0.875rem;
+        }
+
+        .error-message.show {
+            display: flex;
+        }
+
+        .login-footer {
+            padding: 1rem 2rem;
+            background: #f8fafc;
+            border-top: 1px solid #e2e8f0;
+            text-align: center;
+            color: #6b7280;
+            font-size: 0.875rem;
+        }
+
+        .help-text {
+            margin-top: 1rem;
+            color: #6b7280;
+            font-size: 0.875rem;
+            text-align: center;
+        }
+
+        .help-text a {
+            color: #667eea;
+            text-decoration: none;
+        }
+
+        .help-text a:hover {
+            text-decoration: underline;
+        }
+
+        /* Responsive design */
+        @media (max-width: 480px) {
+            .login-container {
+                margin: 0.5rem;
+            }
+            
+            .login-header,
+            .login-form {
+                padding: 1.5rem;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="login-container">
+        <div class="login-header">
+            <div class="logo">
+                <i class="fas fa-comments"></i>
+            </div>
+            <h1>Admin Dashboard</h1>
+            <p>BRO Chat Administration Panel</p>
+        </div>
+
+        <form class="login-form" id="loginForm">
+            <div class="error-message" id="errorMessage">
+                <i class="fas fa-exclamation-triangle"></i>
+                <span id="errorText"></span>
+            </div>
+
+            <div class="form-group">
+                <label for="countryCode">Country & Phone Number</label>
+                <div class="phone-input-group">
+                    <select id="countryCode" name="countryCode" class="country-code" required>
+                        <option value="+1">🇺🇸 +1</option>
+                        <option value="+44">🇬🇧 +44</option>
+                        <option value="+91">🇮🇳 +91</option>
+                        <option value="+86">🇨🇳 +86</option>
+                        <option value="+81">🇯🇵 +81</option>
+                        <option value="+49">🇩🇪 +49</option>
+                        <option value="+33">🇫🇷 +33</option>
+                        <option value="+39">🇮🇹 +39</option>
+                        <option value="+34">🇪🇸 +34</option>
+                        <option value="+55">🇧🇷 +55</option>
+                        <option value="+52">🇲🇽 +52</option>
+                        <option value="+61">🇦🇺 +61</option>
+                        <option value="+7">🇷🇺 +7</option>
+                        <option value="+82">🇰🇷 +82</option>
+                        <option value="+62">🇮🇩 +62</option>
+                    </select>
+                    <input 
+                        type="tel" 
+                        id="phoneNumber" 
+                        name="phoneNumber" 
+                        class="phone-number"
+                        placeholder="Phone number"
+                        required
+                        pattern="[0-9]+"
+                        autocomplete="tel"
+                    >
+                </div>
+            </div>
+
+            <div class="form-group">
+                <label for="password">Password</label>
+                <div class="password-group">
+                    <input 
+                        type="password" 
+                        id="password" 
+                        name="password" 
+                        placeholder="Enter your password"
+                        required
+                        autocomplete="current-password"
+                    >
+                    <button type="button" class="password-toggle" id="passwordToggle">
+                        <i class="fas fa-eye"></i>
+                    </button>
+                </div>
+            </div>
+
+            <button type="submit" class="login-button" id="loginButton">
+                <span id="loginButtonText">Sign In</span>
+                <div class="loading-spinner" id="loadingSpinner" style="display: none;"></div>
+            </button>
+
+            <div class="help-text">
+                Need help accessing your account?<br>
+                <a href="mailto:admin@brochat.com">Contact System Administrator</a>
+            </div>
+        </form>
+
+        <div class="login-footer">
+            &copy; 2024 BRO Chat. All rights reserved.
+        </div>
+    </div>
+
+    <script>
+        class AdminLogin {
+            constructor() {
+                this.form = document.getElementById('loginForm');
+                this.errorMessage = document.getElementById('errorMessage');
+                this.errorText = document.getElementById('errorText');
+                this.loginButton = document.getElementById('loginButton');
+                this.loginButtonText = document.getElementById('loginButtonText');
+                this.loadingSpinner = document.getElementById('loadingSpinner');
+                this.passwordToggle = document.getElementById('passwordToggle');
+                this.passwordInput = document.getElementById('password');
+
+                this.init();
+            }
+
+            init() {
+                this.setupEventListeners();
+                this.checkExistingAuth();
+            }
+
+            setupEventListeners() {
+                this.form.addEventListener('submit', (e) => {
+                    e.preventDefault();
+                    this.handleLogin();
+                });
+
+                this.passwordToggle.addEventListener('click', () => {
+                    this.togglePasswordVisibility();
+                });
+
+                // Auto-hide error message when user starts typing
+                ['countryCode', 'phoneNumber', 'password'].forEach(id => {
+                    document.getElementById(id).addEventListener('input', () => {
+                        this.hideError();
+                    });
+                });
+
+                // Format phone number input
+                document.getElementById('phoneNumber').addEventListener('input', (e) => {
+                    e.target.value = e.target.value.replace(/[^0-9]/g, '');
+                });
+            }
+
+            checkExistingAuth() {
+                const token = localStorage.getItem('adminToken');
+                if (token) {
+                    // Redirect to dashboard if already logged in
+                    window.location.href = '/';
+                }
+            }
+
+            async handleLogin() {
+                const formData = new FormData(this.form);
+                const countryCode = formData.get('countryCode');
+                const phoneNumber = formData.get('phoneNumber');
+                const password = formData.get('password');
+
+                // Validate inputs
+                if (!phoneNumber || !password) {
+                    this.showError('Please fill in all fields');
+                    return;
+                }
+
+                if (phoneNumber.length < 7) {
+                    this.showError('Please enter a valid phone number');
+                    return;
+                }
+
+                this.setLoading(true);
+
+                try {
+                    const response = await fetch('/auth/login', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({
+                            country_code: countryCode,
+                            phone_number: phoneNumber,
+                            password: password
+                        })
+                    });
+
+                    const data = await response.json();
+
+                    if (data.success) {
+                        // Store auth token
+                        localStorage.setItem('adminToken', data.data.access_token);
+                        localStorage.setItem('adminRefreshToken', data.data.refresh_token);
+                        localStorage.setItem('adminUser', JSON.stringify(data.data.user));
+
+                        // Redirect to dashboard
+                        window.location.href = '/';
+                    } else {
+                        this.showError(data.error || 'Login failed');
+                    }
+                } catch (error) {
+                    console.error('Login error:', error);
+                    this.showError('Network error. Please try again.');
+                } finally {
+                    this.setLoading(false);
+                }
+            }
+
+            togglePasswordVisibility() {
+                const type = this.passwordInput.type === 'password' ? 'text' : 'password';
+                this.passwordInput.type = type;
+                
+                const icon = this.passwordToggle.querySelector('i');
+                icon.className = type === 'password' ? 'fas fa-eye' : 'fas fa-eye-slash';
+            }
+
+            showError(message) {
+                this.errorText.textContent = message;
+                this.errorMessage.classList.add('show');
+            }
+
+            hideError() {
+                this.errorMessage.classList.remove('show');
+            }
+
+            setLoading(loading) {
+                this.loginButton.disabled = loading;
+                
+                if (loading) {
+                    this.loginButtonText.textContent = 'Signing In...';
+                    this.loadingSpinner.style.display = 'block';
+                } else {
+                    this.loginButtonText.textContent = 'Sign In';
+                    this.loadingSpinner.style.display = 'none';
+                }
+            }
+        }
+
+        // Initialize admin login when page loads
+        document.addEventListener('DOMContentLoaded', () => {
+            new AdminLogin();
+        });
+
+        // Handle back button and navigation
+        window.addEventListener('pageshow', (event) => {
+            if (event.persisted) {
+                // Page was loaded from cache, check auth again
+                const token = localStorage.getItem('adminToken');
+                if (token) {
+                    window.location.href = '/';
+                }
+            }
+        });
+    </script>
+</body>
+</html>

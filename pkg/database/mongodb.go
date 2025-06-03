@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
+	"strconv"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -33,27 +35,85 @@ type Database struct {
 	Collections *Collections
 }
 
+// Config represents database configuration
+type Config struct {
+	URI               string
+	Database          string
+	MaxPoolSize       uint64
+	MinPoolSize       uint64
+	MaxConnIdleTime   time.Duration
+	ConnectTimeout    time.Duration
+	ServerSelection   time.Duration
+	SocketTimeout     time.Duration
+	HeartbeatInterval time.Duration
+}
+
 var (
 	globalDB *Database
 )
 
-// Connect establishes connection to MongoDB and returns Database instance
-func Connect(mongoURI string) (*Database, error) {
+// LoadConfigFromEnv loads database configuration from environment variables
+func LoadConfigFromEnv() *Config {
+	return &Config{
+		URI:               getEnv("MONGO_URI", "mongodb://localhost:27017/bro_chat"),
+		Database:          getEnv("MONGO_DATABASE", "chatapp"),
+		MaxPoolSize:       uint64(getEnvInt("MONGO_MAX_POOL_SIZE", 100)),
+		MinPoolSize:       uint64(getEnvInt("MONGO_MIN_POOL_SIZE", 5)),
+		MaxConnIdleTime:   time.Duration(getEnvInt("MONGO_MAX_IDLE_TIME_MINUTES", 10)) * time.Minute,
+		ConnectTimeout:    time.Duration(getEnvInt("MONGO_CONNECT_TIMEOUT_SECONDS", 10)) * time.Second,
+		ServerSelection:   time.Duration(getEnvInt("MONGO_SERVER_SELECTION_TIMEOUT_SECONDS", 5)) * time.Second,
+		SocketTimeout:     time.Duration(getEnvInt("MONGO_SOCKET_TIMEOUT_SECONDS", 30)) * time.Second,
+		HeartbeatInterval: time.Duration(getEnvInt("MONGO_HEARTBEAT_INTERVAL_SECONDS", 10)) * time.Second,
+	}
+}
+
+// DefaultConfig returns default database configuration
+func DefaultConfig() *Config {
+	return &Config{
+		URI:               "mongodb://localhost:27017/",
+		Database:          "chatapp",
+		MaxPoolSize:       100,
+		MinPoolSize:       5,
+		MaxConnIdleTime:   10 * time.Minute,
+		ConnectTimeout:    10 * time.Second,
+		ServerSelection:   5 * time.Second,
+		SocketTimeout:     30 * time.Second,
+		HeartbeatInterval: 10 * time.Second,
+	}
+}
+
+// Connect establishes connection to MongoDB using environment variables
+func Connect() (*Database, error) {
+	config := LoadConfigFromEnv()
+	return ConnectWithConfig(config)
+}
+
+// ConnectWithURI establishes connection to MongoDB with provided URI (backward compatibility)
+func ConnectWithURI(mongoURI string) (*Database, error) {
 	if mongoURI == "" {
-		mongoURI = "mongodb://localhost:27017/bro_chat"
+		return Connect() // Fall back to env-based connection
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	config := LoadConfigFromEnv()
+	config.URI = mongoURI
+	return ConnectWithConfig(config)
+}
+
+// ConnectWithConfig establishes connection to MongoDB with custom configuration
+func ConnectWithConfig(config *Config) (*Database, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), config.ConnectTimeout)
 	defer cancel()
 
 	// Client options
 	clientOptions := options.Client().
-		ApplyURI(mongoURI).
-		SetMaxPoolSize(100).
-		SetMinPoolSize(5).
-		SetMaxConnIdleTime(10 * time.Minute).
-		SetConnectTimeout(10 * time.Second).
-		SetServerSelectionTimeout(5 * time.Second)
+		ApplyURI(config.URI).
+		SetMaxPoolSize(config.MaxPoolSize).
+		SetMinPoolSize(config.MinPoolSize).
+		SetMaxConnIdleTime(config.MaxConnIdleTime).
+		SetConnectTimeout(config.ConnectTimeout).
+		SetServerSelectionTimeout(config.ServerSelection).
+		SetSocketTimeout(config.SocketTimeout).
+		SetHeartbeatInterval(config.HeartbeatInterval)
 
 	// Create client
 	client, err := mongo.Connect(ctx, clientOptions)
@@ -66,8 +126,15 @@ func Connect(mongoURI string) (*Database, error) {
 		return nil, fmt.Errorf("failed to ping MongoDB: %w", err)
 	}
 
-	// Extract database name from URI or use default
-	dbName := "chatapp"
+	// Extract database name from config or URI
+	dbName := config.Database
+	if dbName == "" || dbName == "chatapp" {
+		// Try to extract from URI if available
+		if config.URI != "" {
+			// Simple extraction - you might want to use a proper URI parser
+			dbName = "bro_chat" // Default for this project
+		}
+	}
 
 	// Get database
 	db := client.Database(dbName)
@@ -101,8 +168,34 @@ func Connect(mongoURI string) (*Database, error) {
 		log.Printf("Warning: Failed to create some indexes: %v", err)
 	}
 
-	log.Printf("Successfully connected to MongoDB at %s", mongoURI)
+	log.Printf("Successfully connected to MongoDB at %s (database: %s)", config.URI, dbName)
 	return database, nil
+}
+
+// Environment helper functions
+func getEnv(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+func getEnvInt(key string, defaultValue int) int {
+	if value := os.Getenv(key); value != "" {
+		if result, err := strconv.Atoi(value); err == nil {
+			return result
+		}
+	}
+	return defaultValue
+}
+
+func getEnvBool(key string, defaultValue bool) bool {
+	if value := os.Getenv(key); value != "" {
+		if result, err := strconv.ParseBool(value); err == nil {
+			return result
+		}
+	}
+	return defaultValue
 }
 
 // GetDB returns the global database instance
@@ -156,6 +249,51 @@ func Health() error {
 	defer cancel()
 
 	return globalDB.Client.Ping(ctx, readpref.Primary())
+}
+
+// Reconnect attempts to reconnect to the database
+func Reconnect() error {
+	if globalDB != nil {
+		Close() // Close existing connection
+	}
+
+	_, err := Connect()
+	return err
+}
+
+// GetConnectionInfo returns information about the current connection
+func GetConnectionInfo() map[string]interface{} {
+	if globalDB == nil {
+		return map[string]interface{}{
+			"connected": false,
+			"error":     "database not initialized",
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	info := map[string]interface{}{
+		"connected": true,
+		"database":  globalDB.DB.Name(),
+	}
+
+	// Try to get server status
+	var serverStatus bson.M
+	err := globalDB.DB.RunCommand(ctx, bson.D{{Key: "serverStatus", Value: 1}}).Decode(&serverStatus)
+	if err == nil {
+		if host, ok := serverStatus["host"]; ok {
+			info["host"] = host
+		}
+		if version, ok := serverStatus["version"]; ok {
+			info["version"] = version
+		}
+		if uptime, ok := serverStatus["uptime"]; ok {
+			info["uptime"] = uptime
+		}
+	}
+
+	return info
 }
 
 // createIndexes creates necessary indexes for optimal performance

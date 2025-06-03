@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sort"
+	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -119,10 +121,9 @@ func (m *MigrationService) createIndexes(ctx context.Context) error {
 func (m *MigrationService) createUsersIndexes(ctx context.Context) error {
 	collection := m.db.Collection("users")
 
-	// Check existing indexes first
-	existingIndexes, err := m.getExistingIndexes(ctx, collection)
-	if err != nil {
-		return fmt.Errorf("failed to get existing indexes: %w", err)
+	// First, clean up any conflicting indexes
+	if err := m.cleanupConflictingIndexes(ctx, collection); err != nil {
+		log.Printf("Warning: Failed to cleanup conflicting indexes: %v", err)
 	}
 
 	indexes := []mongo.IndexModel{
@@ -160,8 +161,8 @@ func (m *MigrationService) createUsersIndexes(ctx context.Context) error {
 		},
 	}
 
-	// Create indexes that don't already exist
-	err = m.createIndexesSafely(ctx, collection, indexes, existingIndexes)
+	// Create indexes safely
+	err := m.createIndexesSafely(ctx, collection, indexes)
 	if err != nil {
 		return fmt.Errorf("failed to create users indexes: %w", err)
 	}
@@ -173,11 +174,6 @@ func (m *MigrationService) createUsersIndexes(ctx context.Context) error {
 // createChatsIndexes creates indexes for chats collection
 func (m *MigrationService) createChatsIndexes(ctx context.Context) error {
 	collection := m.db.Collection("chats")
-
-	existingIndexes, err := m.getExistingIndexes(ctx, collection)
-	if err != nil {
-		return fmt.Errorf("failed to get existing indexes: %w", err)
-	}
 
 	indexes := []mongo.IndexModel{
 		{
@@ -206,7 +202,7 @@ func (m *MigrationService) createChatsIndexes(ctx context.Context) error {
 		},
 	}
 
-	err = m.createIndexesSafely(ctx, collection, indexes, existingIndexes)
+	err := m.createIndexesSafely(ctx, collection, indexes)
 	if err != nil {
 		return fmt.Errorf("failed to create chats indexes: %w", err)
 	}
@@ -218,11 +214,6 @@ func (m *MigrationService) createChatsIndexes(ctx context.Context) error {
 // createMessagesIndexes creates indexes for messages collection
 func (m *MigrationService) createMessagesIndexes(ctx context.Context) error {
 	collection := m.db.Collection("messages")
-
-	existingIndexes, err := m.getExistingIndexes(ctx, collection)
-	if err != nil {
-		return fmt.Errorf("failed to get existing indexes: %w", err)
-	}
 
 	indexes := []mongo.IndexModel{
 		{
@@ -263,7 +254,7 @@ func (m *MigrationService) createMessagesIndexes(ctx context.Context) error {
 		},
 	}
 
-	err = m.createIndexesSafely(ctx, collection, indexes, existingIndexes)
+	err := m.createIndexesSafely(ctx, collection, indexes)
 	if err != nil {
 		return fmt.Errorf("failed to create messages indexes: %w", err)
 	}
@@ -323,7 +314,7 @@ func (m *MigrationService) createGroupsIndexes(ctx context.Context) error {
 		},
 	}
 
-	_, err := collection.Indexes().CreateMany(ctx, indexes)
+	err := m.createIndexesSafely(ctx, collection, indexes)
 	if err != nil {
 		return fmt.Errorf("failed to create groups indexes: %w", err)
 	}
@@ -375,7 +366,7 @@ func (m *MigrationService) createCallsIndexes(ctx context.Context) error {
 		},
 	}
 
-	_, err := collection.Indexes().CreateMany(ctx, indexes)
+	err := m.createIndexesSafely(ctx, collection, indexes)
 	if err != nil {
 		return fmt.Errorf("failed to create calls indexes: %w", err)
 	}
@@ -427,7 +418,7 @@ func (m *MigrationService) createFilesIndexes(ctx context.Context) error {
 		},
 	}
 
-	_, err := collection.Indexes().CreateMany(ctx, indexes)
+	err := m.createIndexesSafely(ctx, collection, indexes)
 	if err != nil {
 		return fmt.Errorf("failed to create files indexes: %w", err)
 	}
@@ -556,91 +547,146 @@ func (m *MigrationService) GetMigrationStatus(ctx context.Context) (map[string]i
 
 // Helper functions for safe index creation
 
-// getExistingIndexes returns a map of existing indexes with their keys as the key
-func (m *MigrationService) getExistingIndexes(ctx context.Context, collection *mongo.Collection) (map[string]bson.M, error) {
+// cleanupConflictingIndexes removes indexes that might conflict with our desired indexes
+func (m *MigrationService) cleanupConflictingIndexes(ctx context.Context, collection *mongo.Collection) error {
+	// Get all existing indexes
 	cursor, err := collection.Indexes().List(ctx)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer cursor.Close(ctx)
 
-	existingIndexes := make(map[string]bson.M)
-	for cursor.Next(ctx) {
-		var index bson.M
-		if err := cursor.Decode(&index); err != nil {
+	var existingIndexes []bson.M
+	if err := cursor.All(ctx, &existingIndexes); err != nil {
+		return err
+	}
+
+	// Define the key patterns we want to create with their desired names
+	desiredIndexes := map[string]string{
+		"phone_number_1_country_code_1": "phone_unique",
+		"email_1":                       "email_unique",
+		"username_1":                    "username_unique",
+		"full_phone_number_1":           "full_phone_unique",
+	}
+
+	// Check for conflicts and drop indexes with wrong names
+	for _, index := range existingIndexes {
+		indexName, hasName := index["name"].(string)
+		if !hasName || indexName == "_id_" {
+			continue // Skip _id index and indexes without names
+		}
+
+		// Get the key pattern
+		keyDoc, hasKey := index["key"].(bson.M)
+		if !hasKey {
 			continue
 		}
 
-		// Create a key signature for the index
-		if keyDoc, ok := index["key"].(bson.M); ok {
-			keySignature := m.createKeySignature(keyDoc)
-			existingIndexes[keySignature] = index
+		keyPattern := m.createKeyPatternString(keyDoc)
+
+		// Check if this key pattern conflicts with our desired indexes
+		if desiredName, exists := desiredIndexes[keyPattern]; exists {
+			if indexName != desiredName {
+				log.Printf("Dropping conflicting index '%s' with key pattern '%s'", indexName, keyPattern)
+				_, err := collection.Indexes().DropOne(ctx, indexName)
+				if err != nil {
+					log.Printf("Warning: Failed to drop index %s: %v", indexName, err)
+				}
+			}
 		}
 	}
 
-	return existingIndexes, nil
+	return nil
 }
 
-// createKeySignature creates a unique signature for index keys
-func (m *MigrationService) createKeySignature(keys bson.M) string {
-	var signature string
-	for field, direction := range keys {
-		signature += fmt.Sprintf("%s_%v_", field, direction)
+// createKeyPatternString creates a consistent string representation of index keys
+func (m *MigrationService) createKeyPatternString(keys bson.M) string {
+	// Convert to a slice for sorting
+	type keyValue struct {
+		key   string
+		value interface{}
 	}
-	return signature
+
+	var pairs []keyValue
+	for k, v := range keys {
+		pairs = append(pairs, keyValue{key: k, value: v})
+	}
+
+	// Sort by key name for consistency
+	sort.Slice(pairs, func(i, j int) bool {
+		return pairs[i].key < pairs[j].key
+	})
+
+	// Build the pattern string
+	var parts []string
+	for _, pair := range pairs {
+		parts = append(parts, fmt.Sprintf("%s_%v", pair.key, pair.value))
+	}
+
+	return strings.Join(parts, "_")
 }
 
 // createIndexesSafely creates indexes while checking for conflicts
-func (m *MigrationService) createIndexesSafely(ctx context.Context, collection *mongo.Collection, indexes []mongo.IndexModel, existingIndexes map[string]bson.M) error {
-	var indexesToCreate []mongo.IndexModel
+func (m *MigrationService) createIndexesSafely(ctx context.Context, collection *mongo.Collection, indexes []mongo.IndexModel) error {
+	// Get existing indexes
+	cursor, err := collection.Indexes().List(ctx)
+	if err != nil {
+		return err
+	}
+	defer cursor.Close(ctx)
 
-	for _, index := range indexes {
-		// Create key signature for this index
-		keys := index.Keys.(bson.D)
-		keyMap := make(bson.M)
-		for _, elem := range keys {
-			keyMap[elem.Key] = elem.Value
-		}
-		keySignature := m.createKeySignature(keyMap)
+	var existingIndexes []bson.M
+	if err := cursor.All(ctx, &existingIndexes); err != nil {
+		return err
+	}
 
-		// Check if an index with the same keys already exists
-		if existingIndex, exists := existingIndexes[keySignature]; exists {
-			existingName := ""
-			if name, ok := existingIndex["name"].(string); ok {
-				existingName = name
+	// Create a map of existing index names and key patterns
+	existingNames := make(map[string]bool)
+	existingKeyPatterns := make(map[string]string)
+
+	for _, index := range existingIndexes {
+		if name, ok := index["name"].(string); ok {
+			existingNames[name] = true
+
+			if keyDoc, hasKey := index["key"].(bson.M); hasKey {
+				keyPattern := m.createKeyPatternString(keyDoc)
+				existingKeyPatterns[keyPattern] = name
 			}
-
-			// Get the name we want to create
-			wantedName := ""
-			if index.Options != nil && index.Options.Name != nil {
-				wantedName = *index.Options.Name
-			}
-
-			// If names are different, we have a conflict
-			if existingName != "" && wantedName != "" && existingName != wantedName {
-				log.Printf("Index conflict detected: existing '%s' vs wanted '%s' for keys %v", existingName, wantedName, keyMap)
-
-				// Drop the existing index with conflicting name
-				if existingName != "_id_" { // Never drop the _id index
-					log.Printf("Dropping conflicting index: %s", existingName)
-					_, err := collection.Indexes().DropOne(ctx, existingName)
-					if err != nil {
-						log.Printf("Warning: Failed to drop index %s: %v", existingName, err)
-					}
-				}
-
-				// Add to indexes to create
-				indexesToCreate = append(indexesToCreate, index)
-			} else {
-				log.Printf("Index already exists with correct name: %s", existingName)
-			}
-		} else {
-			// Index doesn't exist, add it to the list to create
-			indexesToCreate = append(indexesToCreate, index)
 		}
 	}
 
-	// Create the indexes that need to be created
+	// Create indexes that don't already exist
+	var indexesToCreate []mongo.IndexModel
+	for _, index := range indexes {
+		indexName := ""
+		if index.Options != nil && index.Options.Name != nil {
+			indexName = *index.Options.Name
+		}
+
+		// Check if index with this name already exists
+		if existingNames[indexName] {
+			log.Printf("Index '%s' already exists, skipping", indexName)
+			continue
+		}
+
+		// Check if index with same key pattern already exists
+		keyDoc := make(bson.M)
+		if d, ok := index.Keys.(bson.D); ok {
+			for _, elem := range d {
+				keyDoc[elem.Key] = elem.Value
+			}
+		}
+		keyPattern := m.createKeyPatternString(keyDoc)
+
+		if existingName, exists := existingKeyPatterns[keyPattern]; exists {
+			log.Printf("Index with key pattern '%s' already exists as '%s', skipping", keyPattern, existingName)
+			continue
+		}
+
+		indexesToCreate = append(indexesToCreate, index)
+	}
+
+	// Create the new indexes
 	if len(indexesToCreate) > 0 {
 		log.Printf("Creating %d new indexes", len(indexesToCreate))
 		_, err := collection.Indexes().CreateMany(ctx, indexesToCreate)
