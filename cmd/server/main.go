@@ -13,10 +13,12 @@ import (
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
+	"go.mongodb.org/mongo-driver/mongo"
 
 	"bro/internal/config"
 	"bro/internal/handlers"
 	"bro/internal/middleware"
+	"bro/internal/migrations"
 	"bro/internal/services"
 	"bro/internal/webrtc"
 	"bro/internal/websocket"
@@ -45,6 +47,11 @@ func main() {
 
 	// Get MongoDB database instance for services that need it
 	mongoDB := database.GetDB()
+
+	// Run database migrations and seeding
+	if err := runDatabaseSetup(mongoDB, cfg.Production); err != nil {
+		log.Fatal("Failed to setup database:", err)
+	}
 
 	// Initialize Redis
 	redisClient := redis.NewClient(cfg.RedisURL)
@@ -342,6 +349,28 @@ func main() {
 				"data":    stats,
 			})
 		})
+
+		// Migration status endpoint (admin only)
+		api.GET("/admin/migrations/status", middleware.AdminMiddleware(cfg.JWTSecret), func(c *gin.Context) {
+			migrationService := migrations.NewMigrationService(mongoDB)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			status, err := migrationService.GetMigrationStatus(ctx)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{
+					"success": false,
+					"error":   err.Error(),
+				})
+				return
+			}
+
+			c.JSON(http.StatusOK, gin.H{
+				"success": true,
+				"data":    status,
+			})
+		})
 	}
 
 	// Health check endpoint
@@ -386,7 +415,9 @@ func main() {
 		}
 	}()
 
-	log.Printf("Server started on port %s", cfg.Port)
+	log.Printf("🚀 BRO Chat Server started on port %s", cfg.Port)
+	log.Printf("📚 API Documentation: http://localhost:%s/health", cfg.Port)
+	log.Printf("👤 Admin Panel: http://localhost:%s/", cfg.Port)
 
 	// Wait for interrupt signal to gracefully shutdown the server
 	quit := make(chan os.Signal, 1)
@@ -403,4 +434,41 @@ func main() {
 	}
 
 	log.Println("Server exited")
+}
+
+// runDatabaseSetup handles database migrations and seeding
+func runDatabaseSetup(db *mongo.Database, isProduction bool) error {
+	log.Println("🔧 Setting up database...")
+
+	// Initialize migration service
+	migrationService := migrations.NewMigrationService(db)
+
+	// Run migrations
+	if err := migrationService.RunMigrations(); err != nil {
+		return fmt.Errorf("migration failed: %w", err)
+	}
+
+	// Only seed data in development mode
+	if !isProduction {
+		log.Println("🌱 Seeding development data...")
+
+		seederService := migrations.NewSeederService(db)
+		if err := seederService.SeedData(); err != nil {
+			log.Printf("⚠️  Warning: Failed to seed data: %v", err)
+			// Don't fail startup if seeding fails, it's optional for development
+		} else {
+			log.Println("✅ Development data seeded successfully")
+			log.Println("📋 Test Users Created:")
+			log.Println("   👤 Admin: +11234567890 (password: password123)")
+			log.Println("   👤 User: +10987654321 (password: password123)")
+			log.Println("   👤 Moderator: +15555551234 (password: password123)")
+			log.Println("   👤 User: +17777777777 (password: password123)")
+			log.Println("   👤 User: +19999999999 (password: password123)")
+		}
+	} else {
+		log.Println("🏭 Production mode: Skipping data seeding")
+	}
+
+	log.Println("✅ Database setup completed")
+	return nil
 }

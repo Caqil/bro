@@ -40,7 +40,7 @@ var (
 // Connect establishes connection to MongoDB and returns Database instance
 func Connect(mongoURI string) (*Database, error) {
 	if mongoURI == "" {
-		mongoURI = "mongodb://localhost:27017/chatapp"
+		mongoURI = "mongodb://localhost:27017/bro_chat"
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

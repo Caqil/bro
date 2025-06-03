@@ -1,0 +1,653 @@
+package migrations
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"time"
+
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
+)
+
+// MigrationService handles database migrations and schema setup
+type MigrationService struct {
+	db *mongo.Database
+}
+
+// NewMigrationService creates a new migration service
+func NewMigrationService(db *mongo.Database) *MigrationService {
+	return &MigrationService{
+		db: db,
+	}
+}
+
+// RunMigrations executes all pending migrations
+func (m *MigrationService) RunMigrations() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	log.Println("Starting database migrations...")
+
+	// Create collections if they don't exist
+	if err := m.createCollections(ctx); err != nil {
+		return fmt.Errorf("failed to create collections: %w", err)
+	}
+
+	// Create indexes
+	if err := m.createIndexes(ctx); err != nil {
+		return fmt.Errorf("failed to create indexes: %w", err)
+	}
+
+	// Create admin config if it doesn't exist
+	if err := m.createDefaultAdminConfig(ctx); err != nil {
+		return fmt.Errorf("failed to create admin config: %w", err)
+	}
+
+	log.Println("Database migrations completed successfully")
+	return nil
+}
+
+// createCollections creates all required collections
+func (m *MigrationService) createCollections(ctx context.Context) error {
+	collections := []string{
+		"users",
+		"chats",
+		"messages",
+		"groups",
+		"calls",
+		"files",
+		"admin_configs",
+		"push_tokens",
+		"sessions",
+	}
+
+	for _, collName := range collections {
+		err := m.db.CreateCollection(ctx, collName)
+		if err != nil {
+			// Ignore "collection already exists" error
+			if !mongo.IsDuplicateKeyError(err) && err.Error() != "collection already exists" {
+				log.Printf("Warning: Failed to create collection %s: %v", collName, err)
+			}
+		}
+		log.Printf("Collection '%s' ready", collName)
+	}
+
+	return nil
+}
+
+// createIndexes creates all required database indexes
+func (m *MigrationService) createIndexes(ctx context.Context) error {
+	log.Println("Creating database indexes...")
+
+	// Users collection indexes
+	if err := m.createUsersIndexes(ctx); err != nil {
+		return err
+	}
+
+	// Chats collection indexes
+	if err := m.createChatsIndexes(ctx); err != nil {
+		return err
+	}
+
+	// Messages collection indexes
+	if err := m.createMessagesIndexes(ctx); err != nil {
+		return err
+	}
+
+	// Groups collection indexes
+	if err := m.createGroupsIndexes(ctx); err != nil {
+		return err
+	}
+
+	// Calls collection indexes
+	if err := m.createCallsIndexes(ctx); err != nil {
+		return err
+	}
+
+	// Files collection indexes
+	if err := m.createFilesIndexes(ctx); err != nil {
+		return err
+	}
+
+	log.Println("All indexes created successfully")
+	return nil
+}
+
+// createUsersIndexes creates indexes for users collection
+func (m *MigrationService) createUsersIndexes(ctx context.Context) error {
+	collection := m.db.Collection("users")
+
+	// Check existing indexes first
+	existingIndexes, err := m.getExistingIndexes(ctx, collection)
+	if err != nil {
+		return fmt.Errorf("failed to get existing indexes: %w", err)
+	}
+
+	indexes := []mongo.IndexModel{
+		{
+			Keys:    bson.D{{Key: "phone_number", Value: 1}, {Key: "country_code", Value: 1}},
+			Options: options.Index().SetUnique(true).SetName("phone_unique"),
+		},
+		{
+			Keys:    bson.D{{Key: "email", Value: 1}},
+			Options: options.Index().SetUnique(true).SetSparse(true).SetName("email_unique"),
+		},
+		{
+			Keys:    bson.D{{Key: "username", Value: 1}},
+			Options: options.Index().SetUnique(true).SetSparse(true).SetName("username_unique"),
+		},
+		{
+			Keys:    bson.D{{Key: "full_phone_number", Value: 1}},
+			Options: options.Index().SetUnique(true).SetName("full_phone_unique"),
+		},
+		{
+			Keys:    bson.D{{Key: "created_at", Value: -1}},
+			Options: options.Index().SetName("created_at_desc"),
+		},
+		{
+			Keys:    bson.D{{Key: "last_seen", Value: -1}},
+			Options: options.Index().SetName("last_seen_desc"),
+		},
+		{
+			Keys:    bson.D{{Key: "is_active", Value: 1}},
+			Options: options.Index().SetName("is_active"),
+		},
+		{
+			Keys:    bson.D{{Key: "role", Value: 1}},
+			Options: options.Index().SetName("role"),
+		},
+	}
+
+	// Create indexes that don't already exist
+	err = m.createIndexesSafely(ctx, collection, indexes, existingIndexes)
+	if err != nil {
+		return fmt.Errorf("failed to create users indexes: %w", err)
+	}
+
+	log.Println("Users indexes created")
+	return nil
+}
+
+// createChatsIndexes creates indexes for chats collection
+func (m *MigrationService) createChatsIndexes(ctx context.Context) error {
+	collection := m.db.Collection("chats")
+
+	existingIndexes, err := m.getExistingIndexes(ctx, collection)
+	if err != nil {
+		return fmt.Errorf("failed to get existing indexes: %w", err)
+	}
+
+	indexes := []mongo.IndexModel{
+		{
+			Keys:    bson.D{{Key: "participants", Value: 1}},
+			Options: options.Index().SetName("participants"),
+		},
+		{
+			Keys:    bson.D{{Key: "type", Value: 1}},
+			Options: options.Index().SetName("type"),
+		},
+		{
+			Keys:    bson.D{{Key: "created_at", Value: -1}},
+			Options: options.Index().SetName("created_at_desc"),
+		},
+		{
+			Keys:    bson.D{{Key: "last_activity", Value: -1}},
+			Options: options.Index().SetName("last_activity_desc"),
+		},
+		{
+			Keys:    bson.D{{Key: "is_active", Value: 1}},
+			Options: options.Index().SetName("is_active"),
+		},
+		{
+			Keys:    bson.D{{Key: "created_by", Value: 1}},
+			Options: options.Index().SetName("created_by"),
+		},
+	}
+
+	err = m.createIndexesSafely(ctx, collection, indexes, existingIndexes)
+	if err != nil {
+		return fmt.Errorf("failed to create chats indexes: %w", err)
+	}
+
+	log.Println("Chats indexes created")
+	return nil
+}
+
+// createMessagesIndexes creates indexes for messages collection
+func (m *MigrationService) createMessagesIndexes(ctx context.Context) error {
+	collection := m.db.Collection("messages")
+
+	existingIndexes, err := m.getExistingIndexes(ctx, collection)
+	if err != nil {
+		return fmt.Errorf("failed to get existing indexes: %w", err)
+	}
+
+	indexes := []mongo.IndexModel{
+		{
+			Keys:    bson.D{{Key: "chat_id", Value: 1}, {Key: "created_at", Value: -1}},
+			Options: options.Index().SetName("chat_created_desc"),
+		},
+		{
+			Keys:    bson.D{{Key: "sender_id", Value: 1}},
+			Options: options.Index().SetName("sender_id"),
+		},
+		{
+			Keys:    bson.D{{Key: "type", Value: 1}},
+			Options: options.Index().SetName("type"),
+		},
+		{
+			Keys:    bson.D{{Key: "created_at", Value: -1}},
+			Options: options.Index().SetName("created_at_desc"),
+		},
+		{
+			Keys:    bson.D{{Key: "is_deleted", Value: 1}},
+			Options: options.Index().SetName("is_deleted"),
+		},
+		{
+			Keys:    bson.D{{Key: "reply_to_id", Value: 1}},
+			Options: options.Index().SetSparse(true).SetName("reply_to_id"),
+		},
+		{
+			Keys:    bson.D{{Key: "mentions", Value: 1}},
+			Options: options.Index().SetName("mentions"),
+		},
+		{
+			Keys:    bson.D{{Key: "scheduled_at", Value: 1}},
+			Options: options.Index().SetSparse(true).SetName("scheduled_at"),
+		},
+		{
+			Keys:    bson.D{{Key: "content", Value: "text"}},
+			Options: options.Index().SetName("content_text"),
+		},
+	}
+
+	err = m.createIndexesSafely(ctx, collection, indexes, existingIndexes)
+	if err != nil {
+		return fmt.Errorf("failed to create messages indexes: %w", err)
+	}
+
+	log.Println("Messages indexes created")
+	return nil
+}
+
+// createGroupsIndexes creates indexes for groups collection
+func (m *MigrationService) createGroupsIndexes(ctx context.Context) error {
+	collection := m.db.Collection("groups")
+
+	indexes := []mongo.IndexModel{
+		{
+			Keys:    bson.D{{Key: "chat_id", Value: 1}},
+			Options: options.Index().SetUnique(true).SetName("chat_id_unique"),
+		},
+		{
+			Keys:    bson.D{{Key: "owner", Value: 1}},
+			Options: options.Index().SetName("owner"),
+		},
+		{
+			Keys:    bson.D{{Key: "created_by", Value: 1}},
+			Options: options.Index().SetName("created_by"),
+		},
+		{
+			Keys:    bson.D{{Key: "members.user_id", Value: 1}},
+			Options: options.Index().SetName("members_user_id"),
+		},
+		{
+			Keys:    bson.D{{Key: "admins", Value: 1}},
+			Options: options.Index().SetName("admins"),
+		},
+		{
+			Keys:    bson.D{{Key: "is_active", Value: 1}},
+			Options: options.Index().SetName("is_active"),
+		},
+		{
+			Keys:    bson.D{{Key: "is_public", Value: 1}},
+			Options: options.Index().SetName("is_public"),
+		},
+		{
+			Keys:    bson.D{{Key: "created_at", Value: -1}},
+			Options: options.Index().SetName("created_at_desc"),
+		},
+		{
+			Keys:    bson.D{{Key: "last_activity", Value: -1}},
+			Options: options.Index().SetName("last_activity_desc"),
+		},
+		{
+			Keys:    bson.D{{Key: "invite_code", Value: 1}},
+			Options: options.Index().SetUnique(true).SetName("invite_code_unique"),
+		},
+		{
+			Keys:    bson.D{{Key: "name", Value: "text"}},
+			Options: options.Index().SetName("name_text"),
+		},
+	}
+
+	_, err := collection.Indexes().CreateMany(ctx, indexes)
+	if err != nil {
+		return fmt.Errorf("failed to create groups indexes: %w", err)
+	}
+
+	log.Println("Groups indexes created")
+	return nil
+}
+
+// createCallsIndexes creates indexes for calls collection
+func (m *MigrationService) createCallsIndexes(ctx context.Context) error {
+	collection := m.db.Collection("calls")
+
+	indexes := []mongo.IndexModel{
+		{
+			Keys:    bson.D{{Key: "chat_id", Value: 1}},
+			Options: options.Index().SetName("chat_id"),
+		},
+		{
+			Keys:    bson.D{{Key: "initiator_id", Value: 1}},
+			Options: options.Index().SetName("initiator_id"),
+		},
+		{
+			Keys:    bson.D{{Key: "participants.user_id", Value: 1}},
+			Options: options.Index().SetName("participants_user_id"),
+		},
+		{
+			Keys:    bson.D{{Key: "status", Value: 1}},
+			Options: options.Index().SetName("status"),
+		},
+		{
+			Keys:    bson.D{{Key: "type", Value: 1}},
+			Options: options.Index().SetName("type"),
+		},
+		{
+			Keys:    bson.D{{Key: "created_at", Value: -1}},
+			Options: options.Index().SetName("created_at_desc"),
+		},
+		{
+			Keys:    bson.D{{Key: "initiated_at", Value: -1}},
+			Options: options.Index().SetName("initiated_at_desc"),
+		},
+		{
+			Keys:    bson.D{{Key: "ended_at", Value: -1}},
+			Options: options.Index().SetSparse(true).SetName("ended_at_desc"),
+		},
+		{
+			Keys:    bson.D{{Key: "session_id", Value: 1}},
+			Options: options.Index().SetUnique(true).SetName("session_id_unique"),
+		},
+	}
+
+	_, err := collection.Indexes().CreateMany(ctx, indexes)
+	if err != nil {
+		return fmt.Errorf("failed to create calls indexes: %w", err)
+	}
+
+	log.Println("Calls indexes created")
+	return nil
+}
+
+// createFilesIndexes creates indexes for files collection
+func (m *MigrationService) createFilesIndexes(ctx context.Context) error {
+	collection := m.db.Collection("files")
+
+	indexes := []mongo.IndexModel{
+		{
+			Keys:    bson.D{{Key: "user_id", Value: 1}},
+			Options: options.Index().SetName("user_id"),
+		},
+		{
+			Keys:    bson.D{{Key: "chat_id", Value: 1}},
+			Options: options.Index().SetSparse(true).SetName("chat_id"),
+		},
+		{
+			Keys:    bson.D{{Key: "message_id", Value: 1}},
+			Options: options.Index().SetSparse(true).SetName("message_id"),
+		},
+		{
+			Keys:    bson.D{{Key: "content_type", Value: 1}},
+			Options: options.Index().SetName("content_type"),
+		},
+		{
+			Keys:    bson.D{{Key: "purpose", Value: 1}},
+			Options: options.Index().SetName("purpose"),
+		},
+		{
+			Keys:    bson.D{{Key: "created_at", Value: -1}},
+			Options: options.Index().SetName("created_at_desc"),
+		},
+		{
+			Keys:    bson.D{{Key: "expires_at", Value: 1}},
+			Options: options.Index().SetSparse(true).SetName("expires_at"),
+		},
+		{
+			Keys:    bson.D{{Key: "is_public", Value: 1}},
+			Options: options.Index().SetName("is_public"),
+		},
+		{
+			Keys:    bson.D{{Key: "file_name", Value: "text"}},
+			Options: options.Index().SetName("file_name_text"),
+		},
+	}
+
+	_, err := collection.Indexes().CreateMany(ctx, indexes)
+	if err != nil {
+		return fmt.Errorf("failed to create files indexes: %w", err)
+	}
+
+	log.Println("Files indexes created")
+	return nil
+}
+
+// createDefaultAdminConfig creates default admin configuration
+func (m *MigrationService) createDefaultAdminConfig(ctx context.Context) error {
+	collection := m.db.Collection("admin_configs")
+
+	// Check if admin config already exists
+	count, err := collection.CountDocuments(ctx, bson.M{})
+	if err != nil {
+		return fmt.Errorf("failed to check admin config: %w", err)
+	}
+
+	if count > 0 {
+		log.Println("Admin config already exists, skipping creation")
+		return nil
+	}
+
+	// Create default admin config
+	adminConfig := bson.M{
+		"app_settings": bson.M{
+			"app_name":            "BRO Chat",
+			"app_version":         "1.0.0",
+			"app_description":     "A modern real-time chat application",
+			"default_language":    "en",
+			"supported_languages": []string{"en", "es", "fr", "de"},
+			"timezone":            "UTC",
+			"maintenance_mode":    false,
+			"maintenance_message": "",
+		},
+		"server_config": bson.M{
+			"max_connections":    10000,
+			"request_timeout":    30000000000, // 30 seconds in nanoseconds
+			"keep_alive_timeout": 60000000000, // 60 seconds in nanoseconds
+			"enable_https":       true,
+			"cors_origins":       []string{"*"},
+			"cors_methods":       []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		},
+		"feature_flags": bson.M{
+			"enable_registration":        true,
+			"enable_guest_mode":          false,
+			"enable_group_chats":         true,
+			"enable_voice_calls":         true,
+			"enable_video_calls":         true,
+			"enable_screen_sharing":      true,
+			"enable_file_sharing":        true,
+			"enable_voice_messages":      true,
+			"enable_message_encryption":  true,
+			"enable_delete_for_everyone": true,
+			"enable_message_editing":     true,
+			"enable_forwarding":          true,
+		},
+		"environment":     "development",
+		"config_version":  "1.0.0",
+		"created_at":      time.Now(),
+		"updated_at":      time.Now(),
+		"last_updated_at": time.Now(),
+	}
+
+	_, err = collection.InsertOne(ctx, adminConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create admin config: %w", err)
+	}
+
+	log.Println("Default admin config created")
+	return nil
+}
+
+// DropAllIndexes drops all indexes (useful for development)
+func (m *MigrationService) DropAllIndexes(ctx context.Context) error {
+	collections := []string{"users", "chats", "messages", "groups", "calls", "files"}
+
+	for _, collName := range collections {
+		collection := m.db.Collection(collName)
+		_, err := collection.Indexes().DropAll(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to drop indexes for %s: %w", collName, err)
+		}
+		log.Printf("Dropped all indexes for collection: %s", collName)
+	}
+
+	return nil
+}
+
+// GetMigrationStatus returns the current migration status
+func (m *MigrationService) GetMigrationStatus(ctx context.Context) (map[string]interface{}, error) {
+	status := map[string]interface{}{
+		"timestamp": time.Now(),
+		"status":    "completed",
+	}
+
+	// Check collections
+	collections := []string{"users", "chats", "messages", "groups", "calls", "files", "admin_configs"}
+	collectionStatus := make(map[string]bool)
+
+	for _, collName := range collections {
+		names, err := m.db.ListCollectionNames(ctx, bson.M{"name": collName})
+		collectionStatus[collName] = err == nil && len(names) > 0
+	}
+
+	status["collections"] = collectionStatus
+
+	// Check indexes count
+	indexCounts := make(map[string]int)
+	for _, collName := range collections {
+		if collectionStatus[collName] {
+			collection := m.db.Collection(collName)
+			cursor, err := collection.Indexes().List(ctx)
+			if err == nil {
+				var indexes []bson.M
+				cursor.All(ctx, &indexes)
+				indexCounts[collName] = len(indexes)
+			}
+		}
+	}
+
+	status["index_counts"] = indexCounts
+
+	return status, nil
+}
+
+// Helper functions for safe index creation
+
+// getExistingIndexes returns a map of existing indexes with their keys as the key
+func (m *MigrationService) getExistingIndexes(ctx context.Context, collection *mongo.Collection) (map[string]bson.M, error) {
+	cursor, err := collection.Indexes().List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+
+	existingIndexes := make(map[string]bson.M)
+	for cursor.Next(ctx) {
+		var index bson.M
+		if err := cursor.Decode(&index); err != nil {
+			continue
+		}
+
+		// Create a key signature for the index
+		if keyDoc, ok := index["key"].(bson.M); ok {
+			keySignature := m.createKeySignature(keyDoc)
+			existingIndexes[keySignature] = index
+		}
+	}
+
+	return existingIndexes, nil
+}
+
+// createKeySignature creates a unique signature for index keys
+func (m *MigrationService) createKeySignature(keys bson.M) string {
+	var signature string
+	for field, direction := range keys {
+		signature += fmt.Sprintf("%s_%v_", field, direction)
+	}
+	return signature
+}
+
+// createIndexesSafely creates indexes while checking for conflicts
+func (m *MigrationService) createIndexesSafely(ctx context.Context, collection *mongo.Collection, indexes []mongo.IndexModel, existingIndexes map[string]bson.M) error {
+	var indexesToCreate []mongo.IndexModel
+
+	for _, index := range indexes {
+		// Create key signature for this index
+		keys := index.Keys.(bson.D)
+		keyMap := make(bson.M)
+		for _, elem := range keys {
+			keyMap[elem.Key] = elem.Value
+		}
+		keySignature := m.createKeySignature(keyMap)
+
+		// Check if an index with the same keys already exists
+		if existingIndex, exists := existingIndexes[keySignature]; exists {
+			existingName := ""
+			if name, ok := existingIndex["name"].(string); ok {
+				existingName = name
+			}
+
+			// Get the name we want to create
+			wantedName := ""
+			if index.Options != nil && index.Options.Name != nil {
+				wantedName = *index.Options.Name
+			}
+
+			// If names are different, we have a conflict
+			if existingName != "" && wantedName != "" && existingName != wantedName {
+				log.Printf("Index conflict detected: existing '%s' vs wanted '%s' for keys %v", existingName, wantedName, keyMap)
+
+				// Drop the existing index with conflicting name
+				if existingName != "_id_" { // Never drop the _id index
+					log.Printf("Dropping conflicting index: %s", existingName)
+					_, err := collection.Indexes().DropOne(ctx, existingName)
+					if err != nil {
+						log.Printf("Warning: Failed to drop index %s: %v", existingName, err)
+					}
+				}
+
+				// Add to indexes to create
+				indexesToCreate = append(indexesToCreate, index)
+			} else {
+				log.Printf("Index already exists with correct name: %s", existingName)
+			}
+		} else {
+			// Index doesn't exist, add it to the list to create
+			indexesToCreate = append(indexesToCreate, index)
+		}
+	}
+
+	// Create the indexes that need to be created
+	if len(indexesToCreate) > 0 {
+		log.Printf("Creating %d new indexes", len(indexesToCreate))
+		_, err := collection.Indexes().CreateMany(ctx, indexesToCreate)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
