@@ -1366,7 +1366,6 @@ func (ms *MessageService) processMentions(message *models.Message) {
 }
 
 // sendPushNotifications sends push notifications for new messages
-// sendPushNotifications sends push notifications for new messages
 func (ms *MessageService) sendPushNotifications(message *models.Message) {
 	if ms.pushService == nil {
 		return

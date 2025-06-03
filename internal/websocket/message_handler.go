@@ -333,9 +333,10 @@ func (h *LeaveChatHandler) HandleMessage(client *Client, message *WSMessage) err
 	})
 }
 
-// CallSignalingHandler handles WebRTC call signaling
+// CallSignalingHandler handles WebRTC call signaling - FIXED to route to WebRTC signaling server
 type CallSignalingHandler struct {
-	hub *Hub
+	hub             *Hub
+	signalingServer interface{} // This should be *webrtc.SignalingServer but avoiding circular import
 }
 
 func (h *CallSignalingHandler) GetType() string {
@@ -347,12 +348,24 @@ func (h *CallSignalingHandler) HandleMessage(client *Client, message *WSMessage)
 		return client.SendError("UNAUTHORIZED", "Authentication required", "")
 	}
 
-	// Parse signaling data
+	// Route to WebRTC signaling server if available
+	if h.signalingServer != nil {
+		// Use interface{} to avoid circular imports
+		// The hub should inject the signaling server reference
+		if signalingHandler, ok := h.signalingServer.(interface {
+			HandleSignalingMessage(client *Client, message *WSMessage) error
+		}); ok {
+			return signalingHandler.HandleSignalingMessage(client, message)
+		}
+	}
+
+	// Fallback: Parse signaling data and forward manually
 	var signalData struct {
 		CallID   string      `json:"call_id"`
 		TargetID string      `json:"target_id,omitempty"`
-		Type     string      `json:"type"` // "offer", "answer", "ice-candidate", "end"
+		Type     string      `json:"type"` // "offer", "answer", "ice-candidate", "end", "call_initiate", "call_response"
 		Signal   interface{} `json:"signal,omitempty"`
+		Data     interface{} `json:"data,omitempty"`
 		Metadata interface{} `json:"metadata,omitempty"`
 	}
 
@@ -365,25 +378,24 @@ func (h *CallSignalingHandler) HandleMessage(client *Client, message *WSMessage)
 		return fmt.Errorf("invalid signal data: %w", err)
 	}
 
-	if signalData.CallID == "" {
-		return client.SendError("MISSING_CALL_ID", "Call ID is required", "")
-	}
-
 	if signalData.Type == "" {
 		return client.SendError("MISSING_SIGNAL_TYPE", "Signal type is required", "")
-	}
-
-	callID, err := primitive.ObjectIDFromHex(signalData.CallID)
-	if err != nil {
-		return client.SendError("INVALID_CALL_ID", "Invalid call ID format", "")
 	}
 
 	userID := client.GetUserID()
 
 	// Handle different signal types
 	switch signalData.Type {
+	case "call_initiate":
+		// This should be handled by the WebRTC signaling server
+		return h.handleCallInitiate(client, signalData)
+
+	case "call_response":
+		// This should be handled by the WebRTC signaling server
+		return h.handleCallResponse(client, signalData)
+
 	case "offer", "answer", "ice-candidate":
-		// Forward signaling to target user
+		// Forward signaling to target user if specified
 		if signalData.TargetID == "" {
 			return client.SendError("MISSING_TARGET_ID", "Target user ID is required for signaling", "")
 		}
@@ -393,36 +405,113 @@ func (h *CallSignalingHandler) HandleMessage(client *Client, message *WSMessage)
 			return client.SendError("INVALID_TARGET_ID", "Invalid target user ID format", "")
 		}
 
-		// Forward signal to target user
+		// Forward signal to target user with consistent format
 		h.hub.SendToUser(targetID, "call_signal", map[string]interface{}{
-			"call_id":   callID.Hex(),
-			"from_user": userID.Hex(),
 			"type":      signalData.Type,
+			"call_id":   signalData.CallID,
+			"from_user": userID.Hex(),
 			"signal":    signalData.Signal,
+			"data":      signalData.Data,
 			"metadata":  signalData.Metadata,
 			"timestamp": time.Now().Unix(),
 		})
 
 		logger.Debugf("Forwarded %s signal from %s to %s for call %s",
-			signalData.Type, userID.Hex(), targetID.Hex(), callID.Hex())
+			signalData.Type, userID.Hex(), targetID.Hex(), signalData.CallID)
 
 	case "end":
-		// End call - notify all participants
-		// TODO: Get call participants from database
-		// For now, just set active call to nil
-		client.SetActiveCall(primitive.NilObjectID)
+		// Handle call end
+		if signalData.CallID != "" {
+			callID, err := primitive.ObjectIDFromHex(signalData.CallID)
+			if err == nil {
+				client.SetActiveCall(primitive.NilObjectID)
 
-		logger.Debugf("User %s ended call %s", userID.Hex(), callID.Hex())
+				// Notify other participants about call end
+				h.hub.SendToChat(callID, "call_ended", map[string]interface{}{
+					"call_id":   signalData.CallID,
+					"ended_by":  userID.Hex(),
+					"timestamp": time.Now().Unix(),
+				})
+			}
+		}
+
+		logger.Debugf("User %s ended call %s", userID.Hex(), signalData.CallID)
 
 	default:
 		return client.SendError("UNKNOWN_SIGNAL_TYPE", "Unknown signal type", signalData.Type)
 	}
 
 	return client.SendJSON("signal_sent", map[string]interface{}{
-		"call_id": callID.Hex(),
+		"call_id": signalData.CallID,
 		"type":    signalData.Type,
 		"status":  "success",
 	})
+}
+
+// handleCallInitiate handles call initiation (fallback)
+func (h *CallSignalingHandler) handleCallInitiate(client *Client, signalData struct {
+	CallID   string      `json:"call_id"`
+	TargetID string      `json:"target_id,omitempty"`
+	Type     string      `json:"type"`
+	Signal   interface{} `json:"signal,omitempty"`
+	Data     interface{} `json:"data,omitempty"`
+	Metadata interface{} `json:"metadata,omitempty"`
+}) error {
+	// This should be handled by WebRTC signaling server
+	// For now, just forward to participants
+	userID := client.GetUserID()
+
+	if dataMap, ok := signalData.Data.(map[string]interface{}); ok {
+		if participants, ok := dataMap["participants"].([]interface{}); ok {
+			for _, p := range participants {
+				if participantID, ok := p.(string); ok {
+					if targetID, err := primitive.ObjectIDFromHex(participantID); err == nil {
+						h.hub.SendToUser(targetID, "incoming_call", map[string]interface{}{
+							"call_id":   signalData.CallID,
+							"from_user": userID.Hex(),
+							"call_type": dataMap["type"],
+							"video":     dataMap["video_enabled"],
+							"timestamp": time.Now().Unix(),
+						})
+					}
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// handleCallResponse handles call response (fallback)
+func (h *CallSignalingHandler) handleCallResponse(client *Client, signalData struct {
+	CallID   string      `json:"call_id"`
+	TargetID string      `json:"target_id,omitempty"`
+	Type     string      `json:"type"`
+	Signal   interface{} `json:"signal,omitempty"`
+	Data     interface{} `json:"data,omitempty"`
+	Metadata interface{} `json:"metadata,omitempty"`
+}) error {
+	// This should be handled by WebRTC signaling server
+	// For now, just forward response
+	userID := client.GetUserID()
+
+	if signalData.TargetID != "" {
+		if targetID, err := primitive.ObjectIDFromHex(signalData.TargetID); err == nil {
+			h.hub.SendToUser(targetID, "call_response", map[string]interface{}{
+				"call_id":   signalData.CallID,
+				"from_user": userID.Hex(),
+				"response":  signalData.Data,
+				"timestamp": time.Now().Unix(),
+			})
+		}
+	}
+
+	return nil
+}
+
+// SetSignalingServer sets the WebRTC signaling server reference
+func (h *CallSignalingHandler) SetSignalingServer(server interface{}) {
+	h.signalingServer = server
 }
 
 // MessageHandler for handling chat messages (optional - might be handled via HTTP)

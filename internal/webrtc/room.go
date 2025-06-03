@@ -299,10 +299,9 @@ func (r *Room) JoinRoom(userID primitive.ObjectID, wsClient *websocket.Client) (
 	r.updatePeerStats(1)
 	r.Analytics.ConnectionAttempts++
 
-	// Join WebSocket room
+	// Join WebSocket chat for this call
 	if r.Hub != nil {
-		wsRoomID := fmt.Sprintf("call:%s", r.ID)
-		r.Hub.JoinRoom(wsClient, wsRoomID)
+		r.Hub.JoinChat(wsClient, r.ChatID)
 	}
 
 	// Notify other peers about new participant
@@ -336,6 +335,33 @@ func (r *Room) JoinRoom(userID primitive.ObjectID, wsClient *websocket.Client) (
 	return peer, nil
 }
 
+// CanUserJoin checks if user can join the room
+func (r *Room) CanUserJoin(userID primitive.ObjectID) bool {
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+
+	// Check if room is closed
+	if r.closed {
+		return false
+	}
+
+	// Check if room is full
+	if len(r.Peers) >= r.MaxParticipants {
+		return false
+	}
+
+	// Check if user is already in room
+	if _, exists := r.PeersByUserID[userID]; exists {
+		return false
+	}
+
+	// TODO: Add additional permission checks here
+	// - Check if user is participant of the call
+	// - Check if call requires permission and user has it
+
+	return true
+}
+
 // LeaveRoom removes a peer from the room
 func (r *Room) LeaveRoom(userID primitive.ObjectID) error {
 	r.mutex.Lock()
@@ -356,10 +382,9 @@ func (r *Room) LeaveRoom(userID primitive.ObjectID) error {
 	// Update statistics
 	r.updatePeerStats(-1)
 
-	// Leave WebSocket room
+	// Leave WebSocket chat
 	if r.Hub != nil && peer.WSClient != nil {
-		wsRoomID := fmt.Sprintf("call:%s", r.ID)
-		r.Hub.LeaveRoom(peer.WSClient, wsRoomID)
+		r.Hub.LeaveChat(peer.WSClient, r.ChatID)
 	}
 
 	// Notify other peers about participant leaving
@@ -370,7 +395,7 @@ func (r *Room) LeaveRoom(userID primitive.ObjectID) error {
 	}, "")
 
 	// End call if no peers left or only initiator remains
-	if len(r.Peers) == 0 || (len(r.Peers) == 1 && r.Type == models.CallTypePrivate) {
+	if len(r.Peers) == 0 || (len(r.Peers) == 1 && r.Type == models.CallTypeConference) {
 		r.endCall(primitive.NilObjectID, models.EndReasonNormal)
 	}
 
@@ -809,10 +834,9 @@ func (r *Room) broadcastToRoom(messageType string, data interface{}, exceptPeerI
 		}
 	}
 
-	// Also broadcast through WebSocket hub
+	// Also broadcast through WebSocket hub to chat participants
 	if r.Hub != nil {
-		wsRoomID := fmt.Sprintf("call:%s", r.ID)
-		r.Hub.SendToRoom(wsRoomID, "room_message", map[string]interface{}{
+		r.Hub.SendToChat(r.ChatID, "room_message", map[string]interface{}{
 			"room_id": r.ID,
 			"type":    messageType,
 			"data":    data,

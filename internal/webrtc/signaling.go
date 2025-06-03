@@ -216,11 +216,12 @@ func (s *SignalingServer) HandleSignalingMessage(client *websocket.Client, rawMe
 	}
 
 	// Set metadata
+	clientInfo := client.GetInfo()
 	message.Metadata = SignalingMetadata{
 		Timestamp: time.Now(),
 		MessageID: primitive.NewObjectID().Hex(),
-		Platform:  client.GetInfo().Platform,
-		DeviceID:  client.GetInfo().DeviceID,
+		Platform:  clientInfo.Platform,
+		DeviceID:  clientInfo.DeviceID,
 	}
 
 	// Set sender
@@ -1066,9 +1067,16 @@ func (s *SignalingServer) sendCallNotifications(call *models.Call, notificationT
 				}
 			}
 
-			// TODO: Send push notification through push service
-			// This depends on your actual PushService implementation
-			logger.Infof("Sending %s notification to user %s: %s", notificationType, userID.Hex(), message)
+			// Prepare push notification data
+			pushData := map[string]string{
+				"type":      notificationType,
+				"call_id":   call.ID.Hex(),
+				"call_type": string(call.Type),
+			}
+
+			if err := s.pushService.SendNotification(user.ID, title, message, pushData); err != nil {
+				logger.Errorf("Failed to send push notification: %v", err)
+			}
 		}(participant.UserID)
 	}
 }

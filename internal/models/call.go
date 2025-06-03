@@ -105,6 +105,7 @@ const (
 	CallTypeGroup       CallType = "group"
 	CallTypeConference  CallType = "conference"
 	CallTypeScreenShare CallType = "screen_share"
+	CallTypePrivate     CallType = "private"
 )
 
 type CallStatus string

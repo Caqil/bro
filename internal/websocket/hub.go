@@ -34,6 +34,11 @@ type MessageRecipients struct {
 	Broadcast bool                 `json:"broadcast,omitempty"`
 }
 
+// WebRTCSignalingServer interface to avoid circular imports
+type WebRTCSignalingServer interface {
+	HandleSignalingMessage(client *Client, message *WSMessage) error
+}
+
 // Hub maintains the set of active clients and broadcasts messages to the clients
 type Hub struct {
 	// Registered clients
@@ -44,6 +49,9 @@ type Hub struct {
 
 	// Chat ID to clients mapping for chat rooms
 	chatClients map[primitive.ObjectID]map[*Client]bool
+
+	// WebSocket room management (for calls and other grouped activities)
+	rooms map[string]map[*Client]bool
 
 	// Inbound messages from the clients
 	broadcast chan *WSMessage
@@ -56,6 +64,9 @@ type Hub struct {
 
 	// Message handlers
 	messageHandlers map[string]MessageHandler
+
+	// WebRTC signaling server reference
+	signalingServer WebRTCSignalingServer
 
 	// Redis client for distributed messaging
 	redisClient *redis.Client
@@ -92,6 +103,7 @@ type HubStatistics struct {
 	TotalClients      int
 	TotalUsers        int
 	TotalChats        int
+	TotalRooms        int
 	MessagesProcessed int64
 	LastUpdated       time.Time
 	mutex             sync.RWMutex
@@ -109,6 +121,7 @@ func NewHub(redisClient *redis.Client, jwtSecret string, config *HubConfig) *Hub
 		clients:         make(map[*Client]bool),
 		userClients:     make(map[primitive.ObjectID]map[*Client]bool),
 		chatClients:     make(map[primitive.ObjectID]map[*Client]bool),
+		rooms:           make(map[string]map[*Client]bool),
 		broadcast:       make(chan *WSMessage, 256),
 		register:        make(chan *Client),
 		unregister:      make(chan *Client),
@@ -135,6 +148,18 @@ func DefaultHubConfig() *HubConfig {
 		CleanupInterval:   5 * time.Minute,
 		MessageTimeout:    10 * time.Second,
 		EnableMetrics:     true,
+	}
+}
+
+// SetSignalingServer sets the WebRTC signaling server
+func (h *Hub) SetSignalingServer(server WebRTCSignalingServer) {
+	h.signalingServer = server
+
+	// Update the CallSignalingHandler with the server reference
+	if handler, exists := h.messageHandlers["call_signal"]; exists {
+		if callHandler, ok := handler.(*CallSignalingHandler); ok {
+			callHandler.SetSignalingServer(server)
+		}
 	}
 }
 
@@ -251,6 +276,38 @@ func (h *Hub) SendToChat(chatID primitive.ObjectID, messageType string, data int
 	h.BroadcastMessage(message)
 }
 
+// SendToRoom sends a message to all clients in a WebSocket room
+func (h *Hub) SendToRoom(roomID string, messageType string, data interface{}) {
+	h.mutex.RLock()
+	clients, exists := h.rooms[roomID]
+	h.mutex.RUnlock()
+
+	if !exists {
+		return
+	}
+
+	message := &WSMessage{
+		Type:      messageType,
+		Data:      data,
+		Timestamp: time.Now().Unix(),
+		ID:        primitive.NewObjectID().Hex(),
+	}
+
+	messageData, err := json.Marshal(message)
+	if err != nil {
+		logger.Errorf("Failed to marshal room message: %v", err)
+		return
+	}
+
+	for client := range clients {
+		select {
+		case client.send <- messageData:
+		default:
+			logger.Warnf("Client send channel full, dropping message for client %s", client.GetConnID())
+		}
+	}
+}
+
 // SendToAll sends a message to all connected clients
 func (h *Hub) SendToAll(messageType string, data interface{}) {
 	message := &WSMessage{
@@ -300,6 +357,34 @@ func (h *Hub) LeaveChat(client *Client, chatID primitive.ObjectID) {
 	client.SetActiveChat(chatID, false)
 }
 
+// JoinRoom adds a client to a WebSocket room (for calls, etc.)
+func (h *Hub) JoinRoom(client *Client, roomID string) {
+	h.mutex.Lock()
+	defer h.mutex.Unlock()
+
+	if h.rooms[roomID] == nil {
+		h.rooms[roomID] = make(map[*Client]bool)
+	}
+	h.rooms[roomID][client] = true
+
+	logger.Debugf("Client %s joined room %s", client.GetConnID(), roomID)
+}
+
+// LeaveRoom removes a client from a WebSocket room
+func (h *Hub) LeaveRoom(client *Client, roomID string) {
+	h.mutex.Lock()
+	defer h.mutex.Unlock()
+
+	if clients, exists := h.rooms[roomID]; exists {
+		delete(clients, client)
+		if len(clients) == 0 {
+			delete(h.rooms, roomID)
+		}
+	}
+
+	logger.Debugf("Client %s left room %s", client.GetConnID(), roomID)
+}
+
 // GetUserClients returns all clients for a user
 func (h *Hub) GetUserClients(userID primitive.ObjectID) []*Client {
 	h.mutex.RLock()
@@ -322,6 +407,20 @@ func (h *Hub) GetChatClients(chatID primitive.ObjectID) []*Client {
 	clients := make([]*Client, 0)
 	if chatClients, exists := h.chatClients[chatID]; exists {
 		for client := range chatClients {
+			clients = append(clients, client)
+		}
+	}
+	return clients
+}
+
+// GetRoomClients returns all clients in a room
+func (h *Hub) GetRoomClients(roomID string) []*Client {
+	h.mutex.RLock()
+	defer h.mutex.RUnlock()
+
+	clients := make([]*Client, 0)
+	if roomClients, exists := h.rooms[roomID]; exists {
+		for client := range roomClients {
 			clients = append(clients, client)
 		}
 	}
@@ -360,6 +459,11 @@ func (h *Hub) GetStatistics() *HubStatistics {
 
 // ProcessMessage processes an incoming message from a client
 func (h *Hub) ProcessMessage(client *Client, message *WSMessage) error {
+	// Special handling for WebRTC signaling messages
+	if message.Type == "call_signal" && h.signalingServer != nil {
+		return h.signalingServer.HandleSignalingMessage(client, message)
+	}
+
 	// Find and execute message handler
 	handler, exists := h.messageHandlers[message.Type]
 	if !exists {
@@ -486,6 +590,16 @@ func (h *Hub) unregisterClient(client *Client) {
 				delete(chatClients, client)
 				if len(chatClients) == 0 {
 					delete(h.chatClients, chatID)
+				}
+			}
+		}
+
+		// Remove from all WebSocket rooms
+		for roomID, roomClients := range h.rooms {
+			if _, exists := roomClients[client]; exists {
+				delete(roomClients, client)
+				if len(roomClients) == 0 {
+					delete(h.rooms, roomID)
 				}
 			}
 		}
@@ -675,7 +789,11 @@ func (h *Hub) registerDefaultHandlers() {
 	h.RegisterMessageHandler(&TypingHandler{hub: h})
 	h.RegisterMessageHandler(&JoinChatHandler{hub: h})
 	h.RegisterMessageHandler(&LeaveChatHandler{hub: h})
-	h.RegisterMessageHandler(&CallSignalingHandler{hub: h})
+	h.RegisterMessageHandler(&CallSignalingHandler{hub: h}) // This will be updated with signaling server reference
+	h.RegisterMessageHandler(&ChatMessageHandler{hub: h})
+	h.RegisterMessageHandler(&StatusHandler{hub: h})
+	h.RegisterMessageHandler(&ReactionHandler{hub: h})
+	h.RegisterMessageHandler(&ReadReceiptHandler{hub: h})
 }
 
 // Background processes
@@ -703,12 +821,14 @@ func (h *Hub) updateStatistics() {
 	totalClients := len(h.clients)
 	totalUsers := len(h.userClients)
 	totalChats := len(h.chatClients)
+	totalRooms := len(h.rooms)
 	h.mutex.RUnlock()
 
 	h.stats.mutex.Lock()
 	h.stats.TotalClients = totalClients
 	h.stats.TotalUsers = totalUsers
 	h.stats.TotalChats = totalChats
+	h.stats.TotalRooms = totalRooms
 	h.stats.LastUpdated = time.Now()
 	h.stats.mutex.Unlock()
 }
@@ -796,6 +916,13 @@ func (h *Hub) performCleanup() {
 	for chatID, clients := range h.chatClients {
 		if len(clients) == 0 {
 			delete(h.chatClients, chatID)
+		}
+	}
+
+	// Clean up empty WebSocket rooms
+	for roomID, clients := range h.rooms {
+		if len(clients) == 0 {
+			delete(h.rooms, roomID)
 		}
 	}
 }

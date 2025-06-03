@@ -148,8 +148,9 @@ func NewPeerConnection(userID primitive.ObjectID, callID primitive.ObjectID, roo
 
 	// Get device and platform info from websocket client
 	if wsClient != nil {
-		peer.DeviceID = wsClient.GetInfo().DeviceID
-		peer.Platform = wsClient.GetInfo().Platform
+		clientInfo := wsClient.GetInfo()
+		peer.DeviceID = clientInfo.DeviceID
+		peer.Platform = clientInfo.Platform
 	}
 
 	// Set up WebRTC event handlers
