@@ -912,3 +912,13 @@ func (l *LengthValidator) Validate(value interface{}) *ValidationError {
 
 	return nil
 }
+func (ve *ValidationError) Error() string {
+	if ve == nil {
+		return "validation error"
+	}
+
+	if ve.Field != "" {
+		return fmt.Sprintf("%s: %s", ve.Field, ve.Message)
+	}
+	return ve.Message
+}

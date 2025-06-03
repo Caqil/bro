@@ -35,13 +35,16 @@ const (
 
 // Client represents a websocket client connection
 type Client struct {
+	// Connection ID - unique for each websocket connection
+	connID string
+
 	// The websocket connection
 	conn *websocket.Conn
 
 	// Hub reference
 	hub *Hub
 
-	// User information
+	// User information (set after authentication)
 	userID   primitive.ObjectID
 	user     *models.User
 	deviceID string
@@ -53,8 +56,7 @@ type Client struct {
 	lastPing    time.Time
 
 	// Communication channels
-	send    chan []byte
-	receive chan []byte
+	send chan []byte
 
 	// Client state
 	isAuthenticated bool
@@ -86,6 +88,7 @@ type Client struct {
 
 // ClientInfo represents basic client information
 type ClientInfo struct {
+	ConnID      string             `json:"conn_id"`
 	UserID      primitive.ObjectID `json:"user_id"`
 	DeviceID    string             `json:"device_id"`
 	Platform    string             `json:"platform"`
@@ -97,18 +100,20 @@ type ClientInfo struct {
 
 // NewClient creates a new websocket client
 func NewClient(conn *websocket.Conn, hub *Hub, req *http.Request) *Client {
+	connID := primitive.NewObjectID().Hex()
+
 	client := &Client{
+		connID:          connID,
 		conn:            conn,
 		hub:             hub,
 		send:            make(chan []byte, channelBufferSize),
-		receive:         make(chan []byte, channelBufferSize),
 		connectedAt:     time.Now(),
 		lastPing:        time.Now(),
 		isAuthenticated: false,
 		isOnline:        false,
 		activeChats:     make(map[primitive.ObjectID]bool),
 		closeChannel:    make(chan struct{}),
-		remoteAddr:      conn.RemoteAddr().String(),
+		remoteAddr:      getClientIP(req),
 		userAgent:       req.Header.Get("User-Agent"),
 		headers:         req.Header,
 		redisClient:     redis.GetClient(),
@@ -132,6 +137,7 @@ func (c *Client) GetInfo() ClientInfo {
 	defer c.mutex.RUnlock()
 
 	return ClientInfo{
+		ConnID:      c.connID,
 		UserID:      c.userID,
 		DeviceID:    c.deviceID,
 		Platform:    c.platform,
@@ -140,6 +146,11 @@ func (c *Client) GetInfo() ClientInfo {
 		IsOnline:    c.isOnline,
 		RemoteAddr:  c.remoteAddr,
 	}
+}
+
+// GetConnID returns the connection ID
+func (c *Client) GetConnID() string {
+	return c.connID
 }
 
 // SetUser sets the authenticated user for this client
@@ -161,6 +172,7 @@ func (c *Client) SetUser(user *models.User, sessionID, deviceID, platform string
 	}
 
 	logger.LogUserAction(c.userID.Hex(), "websocket_connected", "websocket", map[string]interface{}{
+		"conn_id":     c.connID,
 		"device_id":   deviceID,
 		"platform":    platform,
 		"remote_addr": c.remoteAddr,
@@ -237,7 +249,7 @@ func (c *Client) GetActiveCall() primitive.ObjectID {
 }
 
 // SendMessage sends a message to the client
-func (c *Client) SendMessage(message *Message) error {
+func (c *Client) SendMessage(message *WSMessage) error {
 	if c.isClosed() {
 		return fmt.Errorf("client connection is closed")
 	}
@@ -259,10 +271,10 @@ func (c *Client) SendMessage(message *Message) error {
 
 // SendJSON sends a JSON message to the client
 func (c *Client) SendJSON(msgType string, data interface{}) error {
-	message := &Message{
+	message := &WSMessage{
 		Type:      msgType,
 		Data:      data,
-		Timestamp: time.Now(),
+		Timestamp: time.Now().Unix(),
 		ID:        primitive.NewObjectID().Hex(),
 	}
 
@@ -275,18 +287,11 @@ func (c *Client) SendJSON(msgType string, data interface{}) error {
 
 // SendError sends an error message to the client
 func (c *Client) SendError(code, message, details string) error {
-	errorMsg := &Message{
-		Type: "error",
-		Data: map[string]interface{}{
-			"code":    code,
-			"message": message,
-			"details": details,
-		},
-		Timestamp: time.Now(),
-		ID:        primitive.NewObjectID().Hex(),
-	}
-
-	return c.SendMessage(errorMsg)
+	return c.SendJSON("error", map[string]interface{}{
+		"code":    code,
+		"message": message,
+		"details": details,
+	})
 }
 
 // checkRateLimit checks if client is within rate limits
@@ -305,13 +310,13 @@ func (c *Client) checkRateLimit() bool {
 	limit := 10
 	if c.isAuthenticated {
 		limit = 60
-		if c.user != nil && c.user.Role == models.RoleAdmin {
+		if c.user != nil && (c.user.Role == models.RoleAdmin || c.user.Role == models.RoleSuper) {
 			limit = 200 // Higher limit for admins
 		}
 	}
 
 	if c.messageCount > limit {
-		logger.Warnf("Rate limit exceeded for client %s (user: %s)", c.remoteAddr, c.userID.Hex())
+		logger.Warnf("Rate limit exceeded for client %s (user: %s)", c.connID, c.userID.Hex())
 		return false
 	}
 
@@ -344,7 +349,7 @@ func (c *Client) readPump() {
 			}
 
 			// Parse message
-			var message Message
+			var message WSMessage
 			if err := json.Unmarshal(messageData, &message); err != nil {
 				logger.Errorf("Failed to unmarshal message: %v", err)
 				c.SendError("INVALID_MESSAGE", "Invalid message format", err.Error())
@@ -355,7 +360,7 @@ func (c *Client) readPump() {
 			if c.isAuthenticated {
 				message.SenderID = c.userID.Hex()
 			}
-			message.Timestamp = time.Now()
+			message.Timestamp = time.Now().Unix()
 
 			// Process message
 			c.hub.ProcessMessage(c, &message)
@@ -428,7 +433,7 @@ func (c *Client) Start() {
 	c.SendJSON("welcome", map[string]interface{}{
 		"message":       "Connected to ChatApp WebSocket",
 		"server_time":   time.Now(),
-		"connection_id": primitive.NewObjectID().Hex(),
+		"connection_id": c.connID,
 	})
 }
 
@@ -449,12 +454,13 @@ func (c *Client) updatePresence(online bool) {
 		"is_online":  online,
 		"connection": c.remoteAddr,
 		"session_id": c.sessionID,
+		"conn_id":    c.connID,
 	}
 
 	if online {
 		// Set online presence with expiration
 		c.redisClient.SetUserOnline(c.userID.Hex(), c.deviceID, 2*time.Minute)
-		c.redisClient.SetWithExpiration(
+		c.redisClient.SetEX(
 			fmt.Sprintf("presence:%s", c.userID.Hex()),
 			presenceData,
 			2*time.Minute,
@@ -465,7 +471,7 @@ func (c *Client) updatePresence(online bool) {
 		presenceData["is_online"] = false
 		c.redisClient.Set(
 			fmt.Sprintf("presence:%s", c.userID.Hex()),
-			presenceData,
+			presenceData, 2*time.Minute,
 		)
 	}
 
@@ -500,14 +506,15 @@ func (c *Client) close() {
 	// Close websocket connection
 	c.conn.Close()
 
-	// Close channels
+	// Close send channel
 	close(c.send)
 
 	// Notify hub about disconnection
 	if c.isAuthenticated {
-		c.hub.unregister <- c
+		c.hub.UnregisterClient(c)
 
 		logger.LogUserAction(c.userID.Hex(), "websocket_disconnected", "websocket", map[string]interface{}{
+			"conn_id":         c.connID,
 			"device_id":       c.deviceID,
 			"platform":        c.platform,
 			"connection_time": time.Since(c.connectedAt).Seconds(),
@@ -562,6 +569,7 @@ func (c *Client) GetStats() map[string]interface{} {
 	defer c.mutex.RUnlock()
 
 	return map[string]interface{}{
+		"conn_id":             c.connID,
 		"user_id":             c.userID.Hex(),
 		"device_id":           c.deviceID,
 		"platform":            c.platform,
@@ -580,4 +588,20 @@ func (c *Client) GetStats() map[string]interface{} {
 		"user_agent":          c.userAgent,
 		"send_queue_size":     len(c.send),
 	}
+}
+
+// Helper function to extract client IP from request
+func getClientIP(req *http.Request) string {
+	// Check X-Forwarded-For header
+	if xff := req.Header.Get("X-Forwarded-For"); xff != "" {
+		return xff
+	}
+
+	// Check X-Real-IP header
+	if xri := req.Header.Get("X-Real-IP"); xri != "" {
+		return xri
+	}
+
+	// Fall back to RemoteAddr
+	return req.RemoteAddr
 }

@@ -578,20 +578,30 @@ func (h *AdminHandler) GetSystemHealth(c *gin.Context) {
 		"services":  map[string]interface{}{},
 	}
 
-	// Check database connection
+	// Check database connection using collections
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	err := database.GetDB().Ping(ctx, nil)
-	if err != nil {
+	collections := database.GetCollections()
+	if collections == nil {
 		health["services"].(map[string]interface{})["database"] = map[string]interface{}{
 			"status": "unhealthy",
-			"error":  err.Error(),
+			"error":  "database collections not available",
 		}
 		health["status"] = "unhealthy"
 	} else {
-		health["services"].(map[string]interface{})["database"] = map[string]interface{}{
-			"status": "healthy",
+		// Test database connectivity with a simple operation
+		_, err := collections.Users.EstimatedDocumentCount(ctx)
+		if err != nil {
+			health["services"].(map[string]interface{})["database"] = map[string]interface{}{
+				"status": "unhealthy",
+				"error":  err.Error(),
+			}
+			health["status"] = "unhealthy"
+		} else {
+			health["services"].(map[string]interface{})["database"] = map[string]interface{}{
+				"status": "healthy",
+			}
 		}
 	}
 

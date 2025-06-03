@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
@@ -1089,7 +1090,8 @@ func (cs *ChatService) canUserRemoveMembers(chat *models.Chat, userID primitive.
 		return false
 	}
 
-	if chat.Settings.OnlyAdminsCanRemoveMembers {
+	// Use the same permission as adding members
+	if chat.Settings.OnlyAdminsCanAddMembers {
 		return cs.isGroupAdmin(chat.ID, userID)
 	}
 
@@ -1209,23 +1211,39 @@ func (cs *ChatService) getUserFromDatabase(userID primitive.ObjectID) (*models.U
 
 	return &user, nil
 }
-
-// sendPushNotification is a helper method to send push notifications
-// TODO: Implement this method based on your actual PushService interface
 func (cs *ChatService) sendPushNotification(user *models.User, title, message string, data map[string]interface{}) error {
-	// This is a placeholder implementation. You'll need to implement this based on your PushService interface.
-	// For example, if your PushService has a method like SendNotification(userID, title, message, data):
-	// return cs.pushService.SendNotification(user.ID, title, message, data)
+	if cs.pushService == nil {
+		return fmt.Errorf("push service not available")
+	}
 
-	// Or if it expects different parameters:
-	// return cs.pushService.SendToUser(user.ID, title, message, data)
+	// Convert data from map[string]interface{} to map[string]string
+	// since your PushService expects map[string]string
+	stringData := make(map[string]string)
+	for key, value := range data {
+		// Convert interface{} values to strings
+		switch v := value.(type) {
+		case string:
+			stringData[key] = v
+		case int:
+			stringData[key] = fmt.Sprintf("%d", v)
+		case int64:
+			stringData[key] = fmt.Sprintf("%d", v)
+		case float64:
+			stringData[key] = fmt.Sprintf("%.2f", v)
+		case bool:
+			stringData[key] = fmt.Sprintf("%t", v)
+		default:
+			// For complex types, convert to JSON string
+			if jsonBytes, err := json.Marshal(v); err == nil {
+				stringData[key] = string(jsonBytes)
+			} else {
+				stringData[key] = fmt.Sprintf("%v", v)
+			}
+		}
+	}
 
-	// For now, we'll just log the notification
-	logger.Infof("Push notification for user %s: %s - %s", user.ID.Hex(), title, message)
-	return nil
+	return cs.pushService.SendNotification(user.ID, title, message, stringData)
 }
-
-// Notification methods
 
 // notifyParticipantsAboutNewChat notifies participants about new chat
 func (cs *ChatService) notifyParticipantsAboutNewChat(chat *models.Chat, creatorID primitive.ObjectID) {
@@ -1234,6 +1252,7 @@ func (cs *ChatService) notifyParticipantsAboutNewChat(chat *models.Chat, creator
 			continue
 		}
 
+		// Send WebSocket notification
 		if cs.hub != nil {
 			data := map[string]interface{}{
 				"chat_id":    chat.ID.Hex(),
@@ -1255,18 +1274,26 @@ func (cs *ChatService) notifyParticipantsAboutNewChat(chat *models.Chat, creator
 				}
 
 				creatorName := cs.getUserInfo(creatorID, userID).Name
+				title := "New Chat"
 				message := fmt.Sprintf("%s added you to a chat", creatorName)
+
 				if chat.Type == models.ChatTypeGroup {
 					message = fmt.Sprintf("%s added you to %s", creatorName, chat.Name)
 				}
 
-				// TODO: Update this call based on your actual PushService interface
-				// This assumes a method like SendNotification(user, title, message, data)
-				// You may need to adjust the method name and parameters based on your implementation
-				if err := cs.sendPushNotification(user, "New Chat", message, map[string]interface{}{
-					"type":    "new_chat",
-					"chat_id": chat.ID.Hex(),
-				}); err != nil {
+				// Prepare push notification data
+				pushData := map[string]string{
+					"type":       "new_chat",
+					"chat_id":    chat.ID.Hex(),
+					"chat_type":  string(chat.Type),
+					"creator_id": creatorID.Hex(),
+				}
+
+				if chat.Name != "" {
+					pushData["chat_name"] = chat.Name
+				}
+
+				if err := cs.pushService.SendNotification(user.ID, title, message, pushData); err != nil {
 					logger.Errorf("Failed to send push notification: %v", err)
 				}
 			}(participantID)
@@ -1276,7 +1303,10 @@ func (cs *ChatService) notifyParticipantsAboutNewChat(chat *models.Chat, creator
 
 // notifyParticipantsAboutChatUpdate notifies participants about chat updates
 func (cs *ChatService) notifyParticipantsAboutChatUpdate(chat *models.Chat, updaterID primitive.ObjectID, updates bson.M) {
+	updaterName := cs.getUserInfo(updaterID, primitive.NilObjectID).Name
+
 	for _, participantID := range chat.Participants {
+		// Send WebSocket notification
 		if cs.hub != nil {
 			data := map[string]interface{}{
 				"chat_id":    chat.ID.Hex(),
@@ -1285,12 +1315,37 @@ func (cs *ChatService) notifyParticipantsAboutChatUpdate(chat *models.Chat, upda
 			}
 			cs.hub.SendToUser(participantID, "chat_updated", data)
 		}
+
+		// Send push notification for significant updates
+		if cs.pushService != nil && cs.shouldSendPushForUpdate(updates) {
+			go func(userID primitive.ObjectID) {
+				user, err := cs.getUserFromDatabase(userID)
+				if err != nil {
+					return
+				}
+
+				title := "Chat Updated"
+				message := cs.createUpdateMessage(chat, updaterName, updates)
+
+				pushData := map[string]string{
+					"type":       "chat_updated",
+					"chat_id":    chat.ID.Hex(),
+					"updater_id": updaterID.Hex(),
+				}
+
+				cs.pushService.SendNotification(user.ID, title, message, pushData)
+			}(participantID)
+		}
 	}
 }
 
 // notifyParticipantsAboutMemberChange notifies about member addition/removal
 func (cs *ChatService) notifyParticipantsAboutMemberChange(chat *models.Chat, action string, affectedUserID, actionBy primitive.ObjectID) {
+	actionByName := cs.getUserInfo(actionBy, primitive.NilObjectID).Name
+	affectedUserName := cs.getUserInfo(affectedUserID, primitive.NilObjectID).Name
+
 	for _, participantID := range chat.Participants {
+		// Send WebSocket notification
 		if cs.hub != nil {
 			data := map[string]interface{}{
 				"chat_id":          chat.ID.Hex(),
@@ -1299,6 +1354,38 @@ func (cs *ChatService) notifyParticipantsAboutMemberChange(chat *models.Chat, ac
 				"action_by":        actionBy.Hex(),
 			}
 			cs.hub.SendToUser(participantID, "member_change", data)
+		}
+
+		// Send push notification
+		if cs.pushService != nil && participantID != actionBy {
+			go func(userID primitive.ObjectID) {
+				user, err := cs.getUserFromDatabase(userID)
+				if err != nil {
+					return
+				}
+
+				title := "Group Updated"
+				var message string
+
+				switch action {
+				case "member_added":
+					message = fmt.Sprintf("%s added %s to %s", actionByName, affectedUserName, chat.Name)
+				case "member_removed":
+					message = fmt.Sprintf("%s removed %s from %s", actionByName, affectedUserName, chat.Name)
+				default:
+					message = fmt.Sprintf("Group %s was updated", chat.Name)
+				}
+
+				pushData := map[string]string{
+					"type":             "member_change",
+					"chat_id":          chat.ID.Hex(),
+					"action":           action,
+					"affected_user_id": affectedUserID.Hex(),
+					"action_by":        actionBy.Hex(),
+				}
+
+				cs.pushService.SendNotification(user.ID, title, message, pushData)
+			}(participantID)
 		}
 	}
 }
@@ -1315,8 +1402,6 @@ func (cs *ChatService) notifyParticipantsAboutChatDeletion(chat *models.Chat, de
 		}
 	}
 }
-
-// Background processes
 
 // statsCollector collects chat statistics
 func (cs *ChatService) statsCollector() {
@@ -1446,4 +1531,31 @@ func (cs *ChatService) Close() error {
 
 	logger.Info("Chat Service shutdown complete")
 	return nil
+}
+
+// shouldSendPushForUpdate determines if a push notification should be sent for an update
+func (cs *ChatService) shouldSendPushForUpdate(updates bson.M) bool {
+	// Send push notifications for name, description, or avatar changes
+	significantFields := []string{"name", "description", "avatar"}
+	for _, field := range significantFields {
+		if _, exists := updates[field]; exists {
+			return true
+		}
+	}
+	return false
+}
+
+// createUpdateMessage creates a human-readable message for chat updates
+func (cs *ChatService) createUpdateMessage(chat *models.Chat, updaterName string, updates bson.M) string {
+	if _, exists := updates["name"]; exists {
+		return fmt.Sprintf("%s changed the group name", updaterName)
+	}
+	if _, exists := updates["description"]; exists {
+		return fmt.Sprintf("%s updated the group description", updaterName)
+	}
+	if _, exists := updates["avatar"]; exists {
+		return fmt.Sprintf("%s changed the group photo", updaterName)
+	}
+
+	return fmt.Sprintf("%s updated the group", updaterName)
 }

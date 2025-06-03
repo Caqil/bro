@@ -4,14 +4,35 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson/primitive"
 
+	"bro/internal/models"
+	"bro/internal/utils"
 	"bro/pkg/logger"
 	"bro/pkg/redis"
 )
+
+// WSMessage represents a websocket message
+type WSMessage struct {
+	Type       string             `json:"type"`
+	Data       interface{}        `json:"data"`
+	ID         string             `json:"id,omitempty"`
+	SenderID   string             `json:"sender_id,omitempty"`
+	ChatID     string             `json:"chat_id,omitempty"`
+	Timestamp  int64              `json:"timestamp"`
+	Recipients *MessageRecipients `json:"recipients,omitempty"`
+}
+
+// MessageRecipients defines who should receive the message
+type MessageRecipients struct {
+	Users     []primitive.ObjectID `json:"users,omitempty"`
+	Chats     []primitive.ObjectID `json:"chats,omitempty"`
+	Broadcast bool                 `json:"broadcast,omitempty"`
+}
 
 // Hub maintains the set of active clients and broadcasts messages to the clients
 type Hub struct {
@@ -21,11 +42,11 @@ type Hub struct {
 	// User ID to clients mapping for quick lookup
 	userClients map[primitive.ObjectID]map[*Client]bool
 
-	// Room to clients mapping for group messaging
-	roomClients map[string]map[*Client]bool
+	// Chat ID to clients mapping for chat rooms
+	chatClients map[primitive.ObjectID]map[*Client]bool
 
 	// Inbound messages from the clients
-	broadcast chan *Message
+	broadcast chan *WSMessage
 
 	// Register requests from the clients
 	register chan *Client
@@ -41,6 +62,9 @@ type Hub struct {
 
 	// Hub statistics
 	stats *HubStatistics
+
+	// Services dependencies
+	jwtSecret string
 
 	// Lifecycle management
 	ctx    context.Context
@@ -60,7 +84,6 @@ type HubConfig struct {
 	HeartbeatInterval time.Duration
 	CleanupInterval   time.Duration
 	MessageTimeout    time.Duration
-	EnableCompression bool
 	EnableMetrics     bool
 }
 
@@ -68,20 +91,14 @@ type HubConfig struct {
 type HubStatistics struct {
 	TotalClients      int
 	TotalUsers        int
-	TotalRooms        int
+	TotalChats        int
 	MessagesProcessed int64
 	LastUpdated       time.Time
 	mutex             sync.RWMutex
 }
 
-// MessageHandler defines the interface for message handlers
-type MessageHandler interface {
-	HandleMessage(client *Client, message *Message) error
-	GetType() string
-}
-
 // NewHub creates a new WebSocket hub
-func NewHub(redisClient *redis.Client, config *HubConfig) *Hub {
+func NewHub(redisClient *redis.Client, jwtSecret string, config *HubConfig) *Hub {
 	if config == nil {
 		config = DefaultHubConfig()
 	}
@@ -91,13 +108,14 @@ func NewHub(redisClient *redis.Client, config *HubConfig) *Hub {
 	hub := &Hub{
 		clients:         make(map[*Client]bool),
 		userClients:     make(map[primitive.ObjectID]map[*Client]bool),
-		roomClients:     make(map[string]map[*Client]bool),
-		broadcast:       make(chan *Message, 256),
+		chatClients:     make(map[primitive.ObjectID]map[*Client]bool),
+		broadcast:       make(chan *WSMessage, 256),
 		register:        make(chan *Client),
 		unregister:      make(chan *Client),
 		messageHandlers: make(map[string]MessageHandler),
 		redisClient:     redisClient,
 		stats:           &HubStatistics{},
+		jwtSecret:       jwtSecret,
 		ctx:             ctx,
 		cancel:          cancel,
 		config:          config,
@@ -116,7 +134,6 @@ func DefaultHubConfig() *HubConfig {
 		HeartbeatInterval: 30 * time.Second,
 		CleanupInterval:   5 * time.Minute,
 		MessageTimeout:    10 * time.Second,
-		EnableCompression: true,
 		EnableMetrics:     true,
 	}
 }
@@ -181,7 +198,7 @@ func (h *Hub) UnregisterClient(client *Client) {
 }
 
 // BroadcastMessage broadcasts a message
-func (h *Hub) BroadcastMessage(message *Message) {
+func (h *Hub) BroadcastMessage(message *WSMessage) {
 	select {
 	case h.broadcast <- message:
 	case <-h.ctx.Done():
@@ -190,10 +207,11 @@ func (h *Hub) BroadcastMessage(message *Message) {
 
 // SendToUser sends a message to specific user
 func (h *Hub) SendToUser(userID primitive.ObjectID, messageType string, data interface{}) {
-	message := &Message{
+	message := &WSMessage{
 		Type:      messageType,
 		Data:      data,
-		Timestamp: time.Now(),
+		Timestamp: time.Now().Unix(),
+		ID:        primitive.NewObjectID().Hex(),
 		Recipients: &MessageRecipients{
 			Users: []primitive.ObjectID{userID},
 		},
@@ -204,10 +222,11 @@ func (h *Hub) SendToUser(userID primitive.ObjectID, messageType string, data int
 
 // SendToUsers sends a message to multiple users
 func (h *Hub) SendToUsers(userIDs []primitive.ObjectID, messageType string, data interface{}) {
-	message := &Message{
+	message := &WSMessage{
 		Type:      messageType,
 		Data:      data,
-		Timestamp: time.Now(),
+		Timestamp: time.Now().Unix(),
+		ID:        primitive.NewObjectID().Hex(),
 		Recipients: &MessageRecipients{
 			Users: userIDs,
 		},
@@ -216,14 +235,16 @@ func (h *Hub) SendToUsers(userIDs []primitive.ObjectID, messageType string, data
 	h.BroadcastMessage(message)
 }
 
-// SendToRoom sends a message to all clients in a room
-func (h *Hub) SendToRoom(roomID string, messageType string, data interface{}) {
-	message := &Message{
+// SendToChat sends a message to all clients in a chat
+func (h *Hub) SendToChat(chatID primitive.ObjectID, messageType string, data interface{}) {
+	message := &WSMessage{
 		Type:      messageType,
 		Data:      data,
-		Timestamp: time.Now(),
+		ChatID:    chatID.Hex(),
+		Timestamp: time.Now().Unix(),
+		ID:        primitive.NewObjectID().Hex(),
 		Recipients: &MessageRecipients{
-			Rooms: []string{roomID},
+			Chats: []primitive.ObjectID{chatID},
 		},
 	}
 
@@ -232,10 +253,11 @@ func (h *Hub) SendToRoom(roomID string, messageType string, data interface{}) {
 
 // SendToAll sends a message to all connected clients
 func (h *Hub) SendToAll(messageType string, data interface{}) {
-	message := &Message{
+	message := &WSMessage{
 		Type:      messageType,
 		Data:      data,
-		Timestamp: time.Now(),
+		Timestamp: time.Now().Unix(),
+		ID:        primitive.NewObjectID().Hex(),
 		Recipients: &MessageRecipients{
 			Broadcast: true,
 		},
@@ -244,52 +266,38 @@ func (h *Hub) SendToAll(messageType string, data interface{}) {
 	h.BroadcastMessage(message)
 }
 
-// JoinRoom adds a client to a room
-func (h *Hub) JoinRoom(client *Client, roomID string) {
+// JoinChat adds a client to a chat room
+func (h *Hub) JoinChat(client *Client, chatID primitive.ObjectID) {
 	h.mutex.Lock()
 	defer h.mutex.Unlock()
 
-	if h.roomClients[roomID] == nil {
-		h.roomClients[roomID] = make(map[*Client]bool)
+	if h.chatClients[chatID] == nil {
+		h.chatClients[chatID] = make(map[*Client]bool)
 	}
-	h.roomClients[roomID][client] = true
+	h.chatClients[chatID][client] = true
 
-	client.mutex.Lock()
-	client.rooms[roomID] = true
-	client.mutex.Unlock()
+	logger.Debugf("Client %s joined chat %s", client.GetConnID(), chatID.Hex())
 
-	logger.Debugf("Client %s joined room %s", client.ID, roomID)
-
-	// Notify room about new member
-	h.SendToRoom(roomID, "user_joined_room", map[string]interface{}{
-		"user_id": client.UserID.Hex(),
-		"room_id": roomID,
-	})
+	// Set active chat for the client
+	client.SetActiveChat(chatID, true)
 }
 
-// LeaveRoom removes a client from a room
-func (h *Hub) LeaveRoom(client *Client, roomID string) {
+// LeaveChat removes a client from a chat room
+func (h *Hub) LeaveChat(client *Client, chatID primitive.ObjectID) {
 	h.mutex.Lock()
 	defer h.mutex.Unlock()
 
-	if clients, exists := h.roomClients[roomID]; exists {
+	if clients, exists := h.chatClients[chatID]; exists {
 		delete(clients, client)
 		if len(clients) == 0 {
-			delete(h.roomClients, roomID)
+			delete(h.chatClients, chatID)
 		}
 	}
 
-	client.mutex.Lock()
-	delete(client.rooms, roomID)
-	client.mutex.Unlock()
+	logger.Debugf("Client %s left chat %s", client.GetConnID(), chatID.Hex())
 
-	logger.Debugf("Client %s left room %s", client.ID, roomID)
-
-	// Notify room about member leaving
-	h.SendToRoom(roomID, "user_left_room", map[string]interface{}{
-		"user_id": client.UserID.Hex(),
-		"room_id": roomID,
-	})
+	// Remove active chat for the client
+	client.SetActiveChat(chatID, false)
 }
 
 // GetUserClients returns all clients for a user
@@ -306,14 +314,14 @@ func (h *Hub) GetUserClients(userID primitive.ObjectID) []*Client {
 	return clients
 }
 
-// GetRoomClients returns all clients in a room
-func (h *Hub) GetRoomClients(roomID string) []*Client {
+// GetChatClients returns all clients in a chat
+func (h *Hub) GetChatClients(chatID primitive.ObjectID) []*Client {
 	h.mutex.RLock()
 	defer h.mutex.RUnlock()
 
 	clients := make([]*Client, 0)
-	if roomClients, exists := h.roomClients[roomID]; exists {
-		for client := range roomClients {
+	if chatClients, exists := h.chatClients[chatID]; exists {
+		for client := range chatClients {
 			clients = append(clients, client)
 		}
 	}
@@ -351,27 +359,18 @@ func (h *Hub) GetStatistics() *HubStatistics {
 }
 
 // ProcessMessage processes an incoming message from a client
-func (h *Hub) ProcessMessage(client *Client, rawMessage []byte) error {
-	var message Message
-	if err := json.Unmarshal(rawMessage, &message); err != nil {
-		return fmt.Errorf("failed to unmarshal message: %w", err)
-	}
-
-	// Set message metadata
-	message.SenderID = client.UserID
-	message.SenderClientID = client.ID
-	message.Timestamp = time.Now()
-
+func (h *Hub) ProcessMessage(client *Client, message *WSMessage) error {
 	// Find and execute message handler
 	handler, exists := h.messageHandlers[message.Type]
 	if !exists {
-		return fmt.Errorf("no handler found for message type: %s", message.Type)
+		logger.Warnf("No handler found for message type: %s", message.Type)
+		return client.SendError("UNKNOWN_MESSAGE_TYPE", "Unknown message type", fmt.Sprintf("No handler for type: %s", message.Type))
 	}
 
 	// Execute handler
-	if err := handler.HandleMessage(client, &message); err != nil {
+	if err := handler.HandleMessage(client, message); err != nil {
 		logger.Errorf("Message handler error for type %s: %v", message.Type, err)
-		return err
+		return client.SendError("HANDLER_ERROR", "Message processing failed", err.Error())
 	}
 
 	// Update statistics
@@ -387,19 +386,39 @@ func (h *Hub) registerClient(client *Client) {
 	h.mutex.Lock()
 	defer h.mutex.Unlock()
 
+	// Add to main clients map
+	h.clients[client] = true
+
+	logger.Infof("Client registered: %s (IP: %s)", client.GetConnID(), client.remoteAddr)
+
+	// Send welcome message
+	client.SendJSON("connection_established", map[string]interface{}{
+		"conn_id":      client.GetConnID(),
+		"server_time":  time.Now(),
+		"capabilities": []string{"messaging", "calls", "file_transfer", "presence", "typing_indicators"},
+	})
+}
+
+// registerAuthenticatedClient handles authenticated client registration
+func (h *Hub) registerAuthenticatedClient(client *Client) {
+	h.mutex.Lock()
+	defer h.mutex.Unlock()
+
+	userID := client.GetUserID()
+
 	// Check if user has too many connections
-	if userClients, exists := h.userClients[client.UserID]; exists {
+	if userClients, exists := h.userClients[userID]; exists {
 		if len(userClients) >= h.config.MaxClientsPerUser {
 			logger.Warnf("User %s has too many connections (%d), closing oldest",
-				client.UserID.Hex(), len(userClients))
+				userID.Hex(), len(userClients))
 
 			// Close oldest client
 			var oldestClient *Client
-			var oldestTime time.Time
+			var oldestTime time.Time = time.Now()
 			for c := range userClients {
-				if oldestClient == nil || c.ConnectedAt.Before(oldestTime) {
+				if c.connectedAt.Before(oldestTime) {
 					oldestClient = c
-					oldestTime = c.ConnectedAt
+					oldestTime = c.connectedAt
 				}
 			}
 			if oldestClient != nil {
@@ -408,35 +427,28 @@ func (h *Hub) registerClient(client *Client) {
 		}
 	}
 
-	// Register client
-	h.clients[client] = true
-
 	// Add to user clients mapping
-	if h.userClients[client.UserID] == nil {
-		h.userClients[client.UserID] = make(map[*Client]bool)
+	if h.userClients[userID] == nil {
+		h.userClients[userID] = make(map[*Client]bool)
 	}
-	h.userClients[client.UserID][client] = true
+	h.userClients[userID][client] = true
 
-	// Update user online status
+	// Update user online status in Redis
 	if h.redisClient != nil {
-		h.redisClient.SetUserOnline(client.UserID.Hex(), client.Platform, 5*time.Minute)
+		h.redisClient.SetUserOnline(userID.Hex(), client.platform, 5*time.Minute)
 	}
 
-	// Auto-join user to their personal room
-	personalRoom := fmt.Sprintf("user:%s", client.UserID.Hex())
-	h.JoinRoom(client, personalRoom)
-
-	logger.Infof("Client registered: %s (User: %s, Platform: %s)",
-		client.ID, client.UserID.Hex(), client.Platform)
+	logger.Infof("Client authenticated: %s (User: %s, Platform: %s)",
+		client.GetConnID(), userID.Hex(), client.platform)
 
 	// Notify user's contacts about online status
-	h.notifyContactsAboutPresence(client.UserID, true)
+	h.notifyContactsAboutPresence(userID, true)
 
-	// Send welcome message
-	client.Send("connection_established", map[string]interface{}{
-		"client_id":    client.ID,
-		"server_time":  time.Now(),
-		"capabilities": []string{"messaging", "calls", "file_transfer", "presence"},
+	// Send authentication success
+	client.SendJSON("authentication_success", map[string]interface{}{
+		"user_id":  userID.Hex(),
+		"platform": client.platform,
+		"features": []string{"messaging", "calls", "file_transfer", "presence", "typing_indicators"},
 	})
 }
 
@@ -450,40 +462,40 @@ func (h *Hub) unregisterClient(client *Client) {
 		delete(h.clients, client)
 	}
 
-	// Remove from user clients mapping
-	if userClients, exists := h.userClients[client.UserID]; exists {
-		delete(userClients, client)
-		if len(userClients) == 0 {
-			delete(h.userClients, client.UserID)
+	// Remove from user clients mapping if authenticated
+	if client.IsAuthenticated() {
+		userID := client.GetUserID()
+		if userClients, exists := h.userClients[userID]; exists {
+			delete(userClients, client)
+			if len(userClients) == 0 {
+				delete(h.userClients, userID)
 
-			// Update user offline status
-			if h.redisClient != nil {
-				h.redisClient.SetUserOffline(client.UserID.Hex())
+				// Update user offline status in Redis
+				if h.redisClient != nil {
+					h.redisClient.SetUserOffline(userID.Hex())
+				}
+
+				// Notify contacts about offline status
+				h.notifyContactsAboutPresence(userID, false)
 			}
+		}
 
-			// Notify contacts about offline status
-			h.notifyContactsAboutPresence(client.UserID, false)
+		// Remove from all chat rooms
+		for chatID, chatClients := range h.chatClients {
+			if _, exists := chatClients[client]; exists {
+				delete(chatClients, client)
+				if len(chatClients) == 0 {
+					delete(h.chatClients, chatID)
+				}
+			}
 		}
 	}
 
-	// Remove from all rooms
-	for roomID := range client.rooms {
-		if roomClients, exists := h.roomClients[roomID]; exists {
-			delete(roomClients, client)
-			if len(roomClients) == 0 {
-				delete(h.roomClients, roomID)
-			}
-		}
-	}
-
-	// Close client connection
-	client.Close()
-
-	logger.Infof("Client unregistered: %s (User: %s)", client.ID, client.UserID.Hex())
+	logger.Infof("Client unregistered: %s", client.GetConnID())
 }
 
 // broadcastMessage handles message broadcasting
-func (h *Hub) broadcastMessage(message *Message) {
+func (h *Hub) broadcastMessage(message *WSMessage) {
 	h.mutex.RLock()
 	defer h.mutex.RUnlock()
 
@@ -504,7 +516,7 @@ func (h *Hub) broadcastMessage(message *Message) {
 			select {
 			case client.send <- messageData:
 			default:
-				logger.Warnf("Client send channel full, dropping message for client %s", client.ID)
+				logger.Warnf("Client send channel full, dropping message for client %s", client.GetConnID())
 			}
 		}
 		return
@@ -517,50 +529,64 @@ func (h *Hub) broadcastMessage(message *Message) {
 				select {
 				case client.send <- messageData:
 				default:
-					logger.Warnf("Client send channel full, dropping message for client %s", client.ID)
+					logger.Warnf("Client send channel full, dropping message for client %s", client.GetConnID())
 				}
 			}
 		}
 	}
 
-	// Send to specific rooms
-	for _, roomID := range recipients.Rooms {
-		if roomClients, exists := h.roomClients[roomID]; exists {
-			for client := range roomClients {
+	// Send to specific chats
+	for _, chatID := range recipients.Chats {
+		if chatClients, exists := h.chatClients[chatID]; exists {
+			for client := range chatClients {
 				select {
 				case client.send <- messageData:
 				default:
-					logger.Warnf("Client send channel full, dropping message for client %s", client.ID)
+					logger.Warnf("Client send channel full, dropping message for client %s", client.GetConnID())
 				}
 			}
 		}
 	}
 
 	// Publish to Redis for distributed messaging
-	if h.redisClient != nil && (len(recipients.Users) > 0 || len(recipients.Rooms) > 0) {
+	if h.redisClient != nil && (len(recipients.Users) > 0 || len(recipients.Chats) > 0) {
 		h.publishToRedis(message)
 	}
 }
 
 // notifyContactsAboutPresence notifies user's contacts about presence change
 func (h *Hub) notifyContactsAboutPresence(userID primitive.ObjectID, isOnline bool) {
-	// This would get user's contacts from database and notify them
-	// For now, we'll just log the presence change
+	// Create presence notification
 	status := "offline"
 	if isOnline {
 		status = "online"
 	}
 
-	logger.Debugf("User %s is now %s", userID.Hex(), status)
+	// Broadcast presence change to all users (they can filter on client side)
+	// In a production app, you'd get user's contacts from database and only notify them
+	h.SendToAll("presence_change", map[string]interface{}{
+		"user_id":   userID.Hex(),
+		"is_online": isOnline,
+		"status":    status,
+		"timestamp": time.Now().Unix(),
+	})
 
-	// In a real implementation, you would:
-	// 1. Get user's contacts from database
-	// 2. Send presence notification to each contact
-	// 3. Update presence cache in Redis
+	logger.Debugf("User %s is now %s", userID.Hex(), status)
+}
+
+// broadcastPresenceChange broadcasts presence change to relevant users
+func (h *Hub) broadcastPresenceChange(userID primitive.ObjectID, isOnline bool, deviceID, platform string) {
+	h.SendToAll("presence_update", map[string]interface{}{
+		"user_id":   userID.Hex(),
+		"is_online": isOnline,
+		"device_id": deviceID,
+		"platform":  platform,
+		"timestamp": time.Now().Unix(),
+	})
 }
 
 // publishToRedis publishes message to Redis for distributed messaging
-func (h *Hub) publishToRedis(message *Message) {
+func (h *Hub) publishToRedis(message *WSMessage) {
 	if h.redisClient == nil {
 		return
 	}
@@ -590,7 +616,7 @@ func (h *Hub) subscribeToRedis() {
 	for {
 		select {
 		case msg := <-subscription.Channel():
-			var message Message
+			var message WSMessage
 			if err := json.Unmarshal([]byte(msg.Payload), &message); err != nil {
 				logger.Errorf("Failed to unmarshal Redis message: %v", err)
 				continue
@@ -605,14 +631,51 @@ func (h *Hub) subscribeToRedis() {
 	}
 }
 
+// authenticateClient authenticates a client with JWT token
+func (h *Hub) authenticateClient(client *Client, token string) error {
+	// Remove "Bearer " prefix if present
+	if strings.HasPrefix(token, "Bearer ") {
+		token = strings.TrimPrefix(token, "Bearer ")
+	}
+
+	// Validate JWT token
+	claims, err := utils.ValidateToken(token, h.jwtSecret)
+	if err != nil {
+		return fmt.Errorf("invalid token: %w", err)
+	}
+
+	// Parse user ID
+	userID, err := primitive.ObjectIDFromHex(claims.UserID)
+	if err != nil {
+		return fmt.Errorf("invalid user ID: %w", err)
+	}
+
+	// Create a basic user object (in production, you might fetch from database)
+	user := &models.User{
+		ID:          userID,
+		PhoneNumber: claims.PhoneNumber,
+		Role:        models.UserRole(claims.Role),
+	}
+
+	// Set user information
+	client.SetUser(user, claims.ID, claims.DeviceID, claims.PhoneNumber) // Using PhoneNumber as platform temporarily
+
+	// Register authenticated client
+	h.registerAuthenticatedClient(client)
+
+	return nil
+}
+
 // registerDefaultHandlers registers default message handlers
 func (h *Hub) registerDefaultHandlers() {
 	// Register default handlers
+	h.RegisterMessageHandler(&AuthHandler{hub: h})
 	h.RegisterMessageHandler(&PingHandler{})
 	h.RegisterMessageHandler(&PresenceHandler{hub: h})
 	h.RegisterMessageHandler(&TypingHandler{hub: h})
-	h.RegisterMessageHandler(&JoinRoomHandler{hub: h})
-	h.RegisterMessageHandler(&LeaveRoomHandler{hub: h})
+	h.RegisterMessageHandler(&JoinChatHandler{hub: h})
+	h.RegisterMessageHandler(&LeaveChatHandler{hub: h})
+	h.RegisterMessageHandler(&CallSignalingHandler{hub: h})
 }
 
 // Background processes
@@ -639,13 +702,13 @@ func (h *Hub) updateStatistics() {
 	h.mutex.RLock()
 	totalClients := len(h.clients)
 	totalUsers := len(h.userClients)
-	totalRooms := len(h.roomClients)
+	totalChats := len(h.chatClients)
 	h.mutex.RUnlock()
 
 	h.stats.mutex.Lock()
 	h.stats.TotalClients = totalClients
 	h.stats.TotalUsers = totalUsers
-	h.stats.TotalRooms = totalRooms
+	h.stats.TotalChats = totalChats
 	h.stats.LastUpdated = time.Now()
 	h.stats.mutex.Unlock()
 }
@@ -684,7 +747,7 @@ func (h *Hub) sendHeartbeats() {
 	h.mutex.RUnlock()
 
 	for _, client := range clients {
-		client.Send("heartbeat", map[string]interface{}{
+		client.SendJSON("heartbeat", map[string]interface{}{
 			"timestamp": time.Now().Unix(),
 		})
 	}
@@ -717,21 +780,22 @@ func (h *Hub) performCleanup() {
 
 	// Find stale clients
 	for client := range h.clients {
-		if client.LastSeen.Before(cutoff) {
+		if client.lastPing.Before(cutoff) || !client.IsHealthy() {
 			staleClients = append(staleClients, client)
 		}
 	}
 
 	// Remove stale clients
 	for _, client := range staleClients {
-		logger.Warnf("Removing stale client: %s", client.ID)
+		logger.Warnf("Removing stale client: %s", client.GetConnID())
 		h.unregisterClient(client)
+		client.Close()
 	}
 
-	// Clean up empty rooms
-	for roomID, clients := range h.roomClients {
+	// Clean up empty chat rooms
+	for chatID, clients := range h.chatClients {
 		if len(clients) == 0 {
-			delete(h.roomClients, roomID)
+			delete(h.chatClients, chatID)
 		}
 	}
 }
