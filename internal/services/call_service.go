@@ -241,8 +241,8 @@ func (cs *CallService) InitiateCall(req *CallRequest) (*CallResponse, error) {
 	if session.Room != nil {
 		response.Room = &CallRoomInfo{
 			RoomID:      session.Room.ID,
-			MaxPeers:    session.Room.MaxPeers,
-			ActivePeers: session.Room.PeerCount,
+			MaxPeers:    session.Room.MaxParticipants, // Fixed: was MaxPeers
+			ActivePeers: len(session.Room.Peers),      // Fixed: was PeerCount
 			IsRecording: session.IsRecording,
 		}
 	}
@@ -339,8 +339,8 @@ func (cs *CallService) AnswerCall(callID primitive.ObjectID, userID primitive.Ob
 	if session.Room != nil {
 		response.Room = &CallRoomInfo{
 			RoomID:      session.Room.ID,
-			MaxPeers:    session.Room.MaxPeers,
-			ActivePeers: session.Room.PeerCount,
+			MaxPeers:    session.Room.MaxParticipants, // Fixed: was MaxPeers
+			ActivePeers: len(session.Room.Peers),      // Fixed: was PeerCount
 			IsRecording: session.IsRecording,
 		}
 	}
@@ -355,90 +355,6 @@ func (cs *CallService) AnswerCall(callID primitive.ObjectID, userID primitive.Ob
 // EndCall ends an active call
 func (cs *CallService) EndCall(callID primitive.ObjectID, userID primitive.ObjectID, reason models.EndReason) error {
 	return cs.endCall(callID, userID, reason)
-}
-
-// endCall internal method to end a call
-func (cs *CallService) endCall(callID primitive.ObjectID, endedBy primitive.ObjectID, reason models.EndReason) error {
-	// Get active call session
-	cs.callsMutex.Lock()
-	session, exists := cs.activeCalls[callID]
-	if exists {
-		delete(cs.activeCalls, callID)
-	}
-	cs.callsMutex.Unlock()
-
-	if !exists {
-		// Try to end call in database anyway
-		return cs.endCallInDatabase(callID, endedBy, reason)
-	}
-
-	session.mutex.Lock()
-	defer session.mutex.Unlock()
-
-	// Mark session as inactive
-	session.IsActive = false
-
-	// Calculate call duration
-	var duration time.Duration
-	if session.Call.StartedAt != nil {
-		duration = time.Since(*session.Call.StartedAt)
-	} else {
-		duration = time.Since(session.StartTime)
-	}
-
-	// Update call in database
-	now := time.Now()
-	session.Call.EndCall(endedBy, reason)
-	session.Call.Duration = int64(duration.Seconds())
-
-	// Update all participants
-	for userID, participant := range session.Participants {
-		if participant.Status == models.ParticipantStatusConnected {
-			participant.Status = models.ParticipantStatusDisconnected
-			if participant.LeftAt == nil {
-				participant.LeftAt = &now
-			}
-		}
-	}
-
-	// Save call to database
-	if err := cs.saveCallToDatabase(session.Call); err != nil {
-		logger.Errorf("Failed to save call to database: %v", err)
-	}
-
-	// Close WebRTC room if exists
-	if session.Room != nil {
-		go func() {
-			if err := session.Room.Close(); err != nil {
-				logger.Errorf("Failed to close WebRTC room: %v", err)
-			}
-		}()
-	}
-
-	// Clear timeout
-	cs.clearCallTimeout(callID)
-
-	// Notify all participants
-	go cs.notifyAllParticipants(session.Call, "call_ended", map[string]interface{}{
-		"ended_by": endedBy.Hex(),
-		"reason":   reason,
-		"duration": duration.Seconds(),
-		"ended_at": now,
-	})
-
-	// Create system message
-	go cs.createCallMessage(session.Call, "call_ended")
-
-	// Update statistics
-	cs.updateCallStats("ended")
-
-	logger.LogUserAction(endedBy.Hex(), "call_ended", "call_service", map[string]interface{}{
-		"call_id":  callID.Hex(),
-		"reason":   reason,
-		"duration": duration.Seconds(),
-	})
-
-	return nil
 }
 
 // JoinCall allows a user to join an ongoing call
@@ -510,8 +426,8 @@ func (cs *CallService) JoinCall(callID primitive.ObjectID, userID primitive.Obje
 	if session.Room != nil {
 		response.Room = &CallRoomInfo{
 			RoomID:      session.Room.ID,
-			MaxPeers:    session.Room.MaxPeers,
-			ActivePeers: session.Room.PeerCount,
+			MaxPeers:    session.Room.MaxParticipants, // Fixed: was MaxPeers
+			ActivePeers: len(session.Room.Peers),      // Fixed: was PeerCount
 			IsRecording: session.IsRecording,
 		}
 	}
@@ -673,8 +589,8 @@ func (cs *CallService) GetActiveCall(callID primitive.ObjectID, userID primitive
 	if session.Room != nil {
 		response.Room = &CallRoomInfo{
 			RoomID:      session.Room.ID,
-			MaxPeers:    session.Room.MaxPeers,
-			ActivePeers: session.Room.PeerCount,
+			MaxPeers:    session.Room.MaxParticipants, // Fixed: was MaxPeers
+			ActivePeers: len(session.Room.Peers),      // Fixed: was PeerCount
 			IsRecording: session.IsRecording,
 		}
 	}
@@ -1007,14 +923,24 @@ func (cs *CallService) createCall(req *CallRequest) (*models.Call, error) {
 // createCallSession creates a call session with WebRTC room
 func (cs *CallService) createCallSession(call *models.Call) (*CallSession, error) {
 	// Create WebRTC room configuration
-	roomConfig := webrtc.DefaultRoomConfig(call.Type)
+	roomConfig := webrtc.DefaultRoomConfig() // Fixed: removed argument
 	roomConfig.MaxParticipants = call.Settings.MaxParticipants
-	roomConfig.VideoEnabled = call.Type == models.CallTypeVideo || call.Type == models.CallTypeGroup
-	roomConfig.AudioEnabled = true
+
+	// Configure based on call type
+	switch call.Type {
+	case models.CallTypeVideo, models.CallTypeGroup, models.CallTypeConference:
+		roomConfig.DefaultFeatures.VideoCall = true
+	default:
+		roomConfig.DefaultFeatures.VideoCall = false
+	}
+
 	roomConfig.EnableRecording = call.Settings.RecordingEnabled
 
-	// Create WebRTC room
-	room := webrtc.NewRoom(call.ID, call.ChatID, call.Type, roomConfig, cs.hub)
+	// Create WebRTC room - Fixed: corrected parameter order
+	room, err := webrtc.NewRoom(call.ID, call.ChatID, call.Type, call.InitiatorID, cs.hub, roomConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create WebRTC room: %w", err)
+	}
 
 	// Create session
 	session := &CallSession{
@@ -1044,7 +970,7 @@ func (cs *CallService) createCallSession(call *models.Call) (*CallSession, error
 	return session, nil
 }
 
-// notifyParticipants sends notifications to all call participants
+// Fixed notifyParticipants method to match the correct SendCallNotification signature
 func (cs *CallService) notifyParticipants(call *models.Call, eventType string) {
 	for _, participant := range call.Participants {
 		if participant.UserID == call.InitiatorID {
@@ -1065,14 +991,158 @@ func (cs *CallService) notifyParticipants(call *models.Call, eventType string) {
 		// Send push notification
 		if cs.pushService != nil {
 			go func(userID primitive.ObjectID) {
+				// Get the caller (initiator) user object
+				caller, err := cs.getUserFromDatabase(call.InitiatorID)
+				if err != nil {
+					logger.Errorf("Failed to get caller info for push notification: %v", err)
+					return
+				}
+
+				// Call the correct SendCallNotification method
+				err = cs.pushService.SendCallNotification(call, caller, userID)
+				if err != nil {
+					logger.Errorf("Failed to send push notification: %v", err)
+				}
+			}(participant.UserID)
+		}
+	}
+}
+
+// Fixed endCall method - remove unused userID variable
+func (cs *CallService) endCall(callID primitive.ObjectID, endedBy primitive.ObjectID, reason models.EndReason) error {
+	// Get active call session
+	cs.callsMutex.Lock()
+	session, exists := cs.activeCalls[callID]
+	if exists {
+		delete(cs.activeCalls, callID)
+	}
+	cs.callsMutex.Unlock()
+
+	if !exists {
+		// Try to end call in database anyway
+		return cs.endCallInDatabase(callID, endedBy, reason)
+	}
+
+	session.mutex.Lock()
+	defer session.mutex.Unlock()
+
+	// Mark session as inactive
+	session.IsActive = false
+
+	// Calculate call duration
+	var duration time.Duration
+	if session.Call.StartedAt != nil {
+		duration = time.Since(*session.Call.StartedAt)
+	} else {
+		duration = time.Since(session.StartTime)
+	}
+
+	// Update call in database
+	now := time.Now()
+	session.Call.EndCall(endedBy, reason)
+	session.Call.Duration = int64(duration.Seconds())
+
+	// Update all participants
+	for participantUserID, participant := range session.Participants {
+		if participant.Status == models.ParticipantStatusConnected {
+			participant.Status = models.ParticipantStatusDisconnected
+			if participant.LeftAt == nil {
+				participant.LeftAt = &now
+			}
+		}
+		// Note: participantUserID is now used, so no unused variable error
+		_ = participantUserID // Explicitly mark as used if needed
+	}
+
+	// Save call to database
+	if err := cs.saveCallToDatabase(session.Call); err != nil {
+		logger.Errorf("Failed to save call to database: %v", err)
+	}
+
+	// Close WebRTC room if exists
+	if session.Room != nil {
+		go func() {
+			if err := session.Room.Close(); err != nil {
+				logger.Errorf("Failed to close WebRTC room: %v", err)
+			}
+		}()
+	}
+
+	// Clear timeout
+	cs.clearCallTimeout(callID)
+
+	// Notify all participants
+	go cs.notifyAllParticipants(session.Call, "call_ended", map[string]interface{}{
+		"ended_by": endedBy.Hex(),
+		"reason":   reason,
+		"duration": duration.Seconds(),
+		"ended_at": now,
+	})
+
+	// Create system message
+	go cs.createCallMessage(session.Call, "call_ended")
+
+	// Update statistics
+	cs.updateCallStats("ended")
+
+	logger.LogUserAction(endedBy.Hex(), "call_ended", "call_service", map[string]interface{}{
+		"call_id":  callID.Hex(),
+		"reason":   reason,
+		"duration": duration.Seconds(),
+	})
+
+	return nil
+}
+
+// Add the missing getUserFromDatabase method to CallService
+func (cs *CallService) getUserFromDatabase(userID primitive.ObjectID) (*models.User, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	var user models.User
+	err := cs.usersCollection.FindOne(ctx, bson.M{"_id": userID}).Decode(&user)
+	if err != nil {
+		return nil, fmt.Errorf("user not found: %w", err)
+	}
+
+	return &user, nil
+}
+
+// Alternative approach if you want to use the generic SendNotification method instead
+func (cs *CallService) notifyParticipantsAlternative(call *models.Call, eventType string) {
+	for _, participant := range call.Participants {
+		if participant.UserID == call.InitiatorID {
+			continue // Don't notify initiator
+		}
+
+		// Send WebSocket notification
+		if cs.hub != nil {
+			data := map[string]interface{}{
+				"call_id":      call.ID.Hex(),
+				"initiator_id": call.InitiatorID.Hex(),
+				"call_type":    call.Type,
+				"chat_id":      call.ChatID.Hex(),
+			}
+			cs.hub.SendToUser(participant.UserID, eventType, data)
+		}
+
+		// Send push notification using the generic SendNotification method
+		if cs.pushService != nil {
+			go func(userID primitive.ObjectID) {
 				initiatorName := cs.getUserName(call.InitiatorID)
+				title := "Incoming Call"
 				message := fmt.Sprintf("Incoming %s call from %s", call.Type, initiatorName)
 
-				err := cs.pushService.SendCallNotification(userID, call.ID, message, map[string]interface{}{
+				// Use the generic SendNotification method with proper string data
+				data := map[string]string{
+					"type":      "incoming_call",
 					"call_id":   call.ID.Hex(),
-					"call_type": call.Type,
+					"call_type": string(call.Type),
+					"chat_id":   call.ChatID.Hex(),
 					"action":    "incoming_call",
-				})
+				}
+
+				err := cs.pushService.SendNotification(userID, title, message, data)
 				if err != nil {
 					logger.Errorf("Failed to send push notification: %v", err)
 				}

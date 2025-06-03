@@ -1032,7 +1032,14 @@ func (r *Room) handleQualityIssue(peer *PeerConnection, issueType string, value 
 	}
 
 	r.mutex.Lock()
-	// Add to call quality issues (assuming this field exists in the Call model)
+	// Add to analytics (you can store quality issues here)
+	if r.Analytics.QualityDistribution == nil {
+		r.Analytics.QualityDistribution = make(map[string]int)
+	}
+	r.Analytics.QualityDistribution[issue.Severity]++
+
+	// You could also store the issue in a slice if you add a QualityIssues field to Room
+	// r.QualityIssues = append(r.QualityIssues, issue)
 	r.mutex.Unlock()
 }
 

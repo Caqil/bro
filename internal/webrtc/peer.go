@@ -538,9 +538,8 @@ func (p *PeerConnection) GetStats() (*PeerStats, error) {
 		case *webrtc.OutboundRTPStreamStats:
 			currentStats.BytesSent = s.BytesSent
 			currentStats.PacketsSent = uint64(s.PacketsSent)
-		case *webrtc.CandidatePairStats:
-			currentStats.RTT = uint32(s.CurrentRoundTripTime * 1000) // Convert to ms
-			currentStats.AvailableBandwidth = s.AvailableOutgoingBitrate
+		case *webrtc.ICECandidatePairStats:
+			currentStats.RTT = uint32(s.CurrentRoundTripTime * 1000)
 		}
 	}
 

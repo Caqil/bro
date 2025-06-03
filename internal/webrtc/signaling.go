@@ -14,14 +14,12 @@ import (
 
 	"bro/internal/config"
 	"bro/internal/models"
-	"bro/internal/services"
 	"bro/internal/websocket"
 	"bro/pkg/database"
 	"bro/pkg/logger"
 	"bro/pkg/redis"
 )
 
-// SignalingServer manages WebRTC signaling for all calls
 type SignalingServer struct {
 	// Configuration
 	config *config.Config
@@ -36,9 +34,9 @@ type SignalingServer struct {
 	hub         *websocket.Hub
 	redisClient *redis.Client
 
-	// Services
-	chatService *services.ChatService
-	pushService *services.PushService
+	// Services (using interfaces to avoid circular dependency)
+	chatService ChatServiceInterface
+	pushService PushServiceInterface
 
 	// Room management
 	rooms       map[primitive.ObjectID]*Room // CallID -> Room
@@ -62,6 +60,72 @@ type SignalingServer struct {
 	// Timeouts and intervals
 	callTimeout    time.Duration
 	ringingTimeout time.Duration
+}
+
+// NewSignalingServer creates a new WebRTC signaling server
+func NewSignalingServer(
+	cfg *config.Config,
+	hub *websocket.Hub,
+	chatService ChatServiceInterface,
+	pushService PushServiceInterface,
+) (*SignalingServer, error) {
+
+	collections := database.GetCollections()
+	if collections == nil {
+		return nil, fmt.Errorf("database collections not available")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	server := &SignalingServer{
+		config:           cfg,
+		callsCollection:  collections.Calls,
+		chatsCollection:  collections.Chats,
+		usersCollection:  collections.Users,
+		groupsCollection: collections.Groups,
+		hub:              hub,
+		redisClient:      redis.GetClient(),
+		chatService:      chatService,
+		pushService:      pushService,
+		rooms:            make(map[primitive.ObjectID]*Room),
+		roomsByUser:      make(map[primitive.ObjectID]*Room),
+		messageHandlers:  make(map[string]SignalingHandler),
+		stats:            &SignalingStatistics{LastUpdated: time.Now()},
+		ctx:              ctx,
+		cancel:           cancel,
+		callTimeout:      5 * time.Minute,
+		ringingTimeout:   60 * time.Second,
+	}
+
+	// Load WebRTC configuration
+	server.webrtcConfig = models.WebRTCServiceConfig{
+		STUNServers: []models.STUNServer{
+			{URL: "stun:stun.l.google.com:19302"},
+			{URL: "stun:stun1.l.google.com:19302"},
+		},
+		TURNServers: []models.TURNServerConfig{
+			// TURN servers would be configured here
+		},
+		ICEConnectionTimeout: 30 * time.Second,
+		DTLSTimeout:          10 * time.Second,
+		EnableIPv6:           true,
+		MaxBitrate:           2000000,
+		MinBitrate:           100000,
+		AdaptiveBitrate:      true,
+		EnableRecording:      true,
+		RecordingFormat:      "mp4",
+	}
+
+	// Register message handlers
+	server.registerMessageHandlers()
+
+	// Start background processes
+	server.wg.Add(2)
+	go server.statsCollector()
+	go server.callTimeoutManager()
+
+	logger.Info("WebRTC Signaling Server initialized successfully")
+	return server, nil
 }
 
 // SignalingStatistics contains signaling server statistics
@@ -119,73 +183,6 @@ type CallResponse struct {
 	Accept       bool                 `json:"accept"`
 	VideoEnabled bool                 `json:"video_enabled"`
 	RejectReason *models.RejectReason `json:"reject_reason,omitempty"`
-}
-
-// NewSignalingServer creates a new WebRTC signaling server
-func NewSignalingServer(
-	cfg *config.Config,
-	hub *websocket.Hub,
-	chatService *services.ChatService,
-	pushService *services.PushService,
-) (*SignalingServer, error) {
-
-	collections := database.GetCollections()
-	if collections == nil {
-		return nil, fmt.Errorf("database collections not available")
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-
-	server := &SignalingServer{
-		config:           cfg,
-		callsCollection:  collections.Calls,
-		chatsCollection:  collections.Chats,
-		usersCollection:  collections.Users,
-		groupsCollection: collections.Groups,
-		hub:              hub,
-		redisClient:      redis.GetClient(),
-		chatService:      chatService,
-		pushService:      pushService,
-		rooms:            make(map[primitive.ObjectID]*Room),
-		roomsByUser:      make(map[primitive.ObjectID]*Room),
-		messageHandlers:  make(map[string]SignalingHandler),
-		stats:            &SignalingStatistics{LastUpdated: time.Now()},
-		ctx:              ctx,
-		cancel:           cancel,
-		callTimeout:      5 * time.Minute,
-		ringingTimeout:   60 * time.Second,
-	}
-
-	// Load WebRTC configuration
-	// This would typically come from admin config or environment
-	server.webrtcConfig = models.WebRTCServiceConfig{
-		STUNServers: []models.STUNServer{
-			{URL: "stun:stun.l.google.com:19302"},
-			{URL: "stun:stun1.l.google.com:19302"},
-		},
-		TURNServers: []models.TURNServerConfig{
-			// TURN servers would be configured here
-		},
-		ICEConnectionTimeout: 30 * time.Second,
-		DTLSTimeout:          10 * time.Second,
-		EnableIPv6:           true,
-		MaxBitrate:           2000000,
-		MinBitrate:           100000,
-		AdaptiveBitrate:      true,
-		EnableRecording:      true,
-		RecordingFormat:      "mp4",
-	}
-
-	// Register message handlers
-	server.registerMessageHandlers()
-
-	// Start background processes
-	server.wg.Add(2)
-	go server.statsCollector()
-	go server.callTimeoutManager()
-
-	logger.Info("WebRTC Signaling Server initialized successfully")
-	return server, nil
 }
 
 // registerMessageHandlers registers all signaling message handlers
@@ -969,11 +966,22 @@ func (s *SignalingServer) validateParticipants(participantIDs []primitive.Object
 // createRoom creates a new room for the call
 func (s *SignalingServer) createRoom(call *models.Call) (*Room, error) {
 	roomConfig := &RoomConfig{
-		MaxParticipants:   call.Settings.MaxParticipants,
-		WebRTCConfig:      s.webrtcConfig,
-		DefaultSettings:   call.Settings,
-		DefaultFeatures:   call.Features,
-		QualitySettings:   call.QualitySettings,
+		MaxParticipants: call.Settings.MaxParticipants,
+		WebRTCConfig:    s.webrtcConfig,
+		DefaultSettings: call.Settings,
+		DefaultFeatures: call.Features,
+		// Use the settings from the call model:
+		QualitySettings: models.CallQualitySettings{
+			VideoMinBitrate:  100000,
+			VideoMaxBitrate:  int(call.Settings.MaxVideoBitrate),
+			AudioMinBitrate:  32000,
+			AudioMaxBitrate:  int(call.Settings.MaxAudioBitrate),
+			MinFrameRate:     15,
+			MaxFrameRate:     30,
+			AdaptiveQuality:  call.Settings.AdaptiveQuality,
+			NoiseReduction:   true,
+			EchoCancellation: true,
+		},
 		EnableRecording:   call.Settings.RecordingEnabled,
 		EnableAnalytics:   true,
 		HeartbeatInterval: 30 * time.Second,
