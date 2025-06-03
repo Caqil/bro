@@ -63,9 +63,6 @@ var (
 	// Username pattern (alphanumeric + underscore, 3-30 chars)
 	UsernamePattern = regexp.MustCompile(`^[a-zA-Z0-9_]{3,30}$`)
 
-	// Strong password pattern
-	StrongPasswordPattern = regexp.MustCompile(`^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,}$`)
-
 	// URL pattern
 	URLPattern = regexp.MustCompile(`^https?://[^\s/$.?#].[^\s]*$`)
 

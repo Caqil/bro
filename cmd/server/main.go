@@ -12,11 +12,6 @@ import (
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
-	socketio "github.com/googollee/go-socket.io"
-	"github.com/googollee/go-socket.io/engineio"
-	"github.com/googollee/go-socket.io/engineio/transport"
-	"github.com/googollee/go-socket.io/engineio/transport/polling"
-	"github.com/googollee/go-socket.io/engineio/transport/websocket"
 	"github.com/joho/godotenv"
 
 	"bro/internal/config"
@@ -43,36 +38,57 @@ func main() {
 	cfg := config.Load()
 
 	// Initialize database
-	db, err := database.Connect(cfg.MongoURI)
+	_, err := database.Connect(cfg.MongoURI)
 	if err != nil {
 		log.Fatal("Failed to connect to MongoDB:", err)
 	}
 
+	// Get MongoDB database instance for services that need it
+	mongoDB := database.GetDB()
+
 	// Initialize Redis
 	redisClient := redis.NewClient(cfg.RedisURL)
 
-	// Initialize services
-	authService := services.NewAuthService(db, redisClient, cfg)
+	// Initialize WebSocket hub with correct parameters
+	hubConfig := websocket.DefaultHubConfig()
+	hub := websocket.NewHub(redisClient, cfg.JWTSecret, hubConfig)
+	go hub.Run()
+
+	// Initialize services in correct dependency order
+	authService := services.NewAuthService(mongoDB, redisClient, cfg)
 	smsService := services.NewSMSService(cfg)
 	pushService := services.NewPushService(cfg)
 	fileService := services.NewFileService(cfg)
-	callService := services.NewCallService(db, cfg)
 
-	// Initialize WebSocket hub
-	hub := websocket.NewHub()
-	go hub.Run()
+	// Initialize WebRTC signaling server first (CallService depends on it)
+	signalingServer, err := webrtc.NewSignalingServer(cfg, hub, nil, pushService)
+	if err != nil {
+		log.Fatal("Failed to initialize WebRTC signaling server:", err)
+	}
 
-	// Initialize WebRTC manager
-	rtcManager := webrtc.NewManager(cfg.COTURNConfig)
+	// Initialize call service with correct parameters and error handling
+	callService, err := services.NewCallService(cfg, signalingServer, hub, pushService, smsService)
+	if err != nil {
+		log.Fatal("Failed to initialize call service:", err)
+	}
 
-	// Initialize handlers
-	authHandler := handlers.NewAuthHandler(authService, smsService)
-	chatHandler := handlers.NewChatHandler(db, hub, pushService)
-	messageHandler := handlers.NewMessageHandler(db, hub, pushService)
-	groupHandler := handlers.NewGroupHandler(db, hub, pushService)
-	callHandler := handlers.NewCallHandler(callService, rtcManager, hub)
+	// Initialize handlers with correct constructors
+	authHandler := handlers.NewAuthHandler(authService)
+	groupHandler := handlers.NewGroupHandler()
+	callHandler := handlers.NewCallHandler(callService)
 	fileHandler := handlers.NewFileHandler(fileService)
-	adminHandler := handlers.NewAdminHandler(db, cfg)
+	adminHandler := handlers.NewAdminHandler(
+		authService,
+		fileService,
+		callService,
+		pushService,
+		smsService,
+	)
+
+	// Note: ChatHandler and MessageHandler need ChatService and MessageService
+	// which don't exist yet, so we'll comment them out for now
+	// chatHandler := handlers.NewChatHandler(chatService)
+	// messageHandler := handlers.NewMessageHandler(messageService)
 
 	// Setup Gin router
 	if cfg.Production {
@@ -97,14 +113,14 @@ func main() {
 	router.Use(middleware.RateLimit())
 
 	// Setup Socket.IO server
-	server := setupSocketIO(hub, rtcManager, cfg)
-	router.GET("/socket.io/*any", gin.WrapH(server))
-	router.POST("/socket.io/*any", gin.WrapH(server))
+	//server := setupSocketIO(hub, signalingServer, cfg)
+	// router.GET("/socket.io/*any", gin.WrapH(server))
+	// router.POST("/socket.io/*any", gin.WrapH(server))
 
 	// API routes
 	api := router.Group("/api")
 	{
-		// Public routes
+		// Public authentication routes
 		auth := api.Group("/auth")
 		{
 			auth.POST("/register", authHandler.Register)
@@ -118,42 +134,79 @@ func main() {
 		protected := api.Group("/")
 		protected.Use(middleware.AuthMiddleware(cfg.JWTSecret))
 		{
-			// User routes
+			// User profile routes
 			protected.GET("/profile", authHandler.GetProfile)
 			protected.PUT("/profile", authHandler.UpdateProfile)
+			protected.PUT("/change-password", authHandler.ChangePassword)
 			protected.POST("/logout", authHandler.Logout)
+			protected.GET("/validate", authHandler.ValidateToken)
 
-			// Chat routes
-			chats := protected.Group("/chats")
-			{
-				chats.GET("", chatHandler.GetChats)
-				chats.POST("", chatHandler.CreateChat)
-				chats.GET("/:id", chatHandler.GetChat)
-				chats.PUT("/:id", chatHandler.UpdateChat)
-				chats.DELETE("/:id", chatHandler.DeleteChat)
-				chats.GET("/:id/messages", messageHandler.GetMessages)
-				chats.POST("/:id/messages", messageHandler.SendMessage)
-				chats.PUT("/:id/read", messageHandler.MarkAsRead)
-			}
-
-			// Message routes
-			messages := protected.Group("/messages")
-			{
-				messages.PUT("/:id", messageHandler.UpdateMessage)
-				messages.DELETE("/:id", messageHandler.DeleteMessage)
-				messages.PUT("/:id/status", messageHandler.UpdateMessageStatus)
-			}
+			// Contact routes
 
 			// Group routes
 			groups := protected.Group("/groups")
 			{
 				groups.POST("", groupHandler.CreateGroup)
-				groups.GET("/:id", groupHandler.GetGroup)
-				groups.PUT("/:id", groupHandler.UpdateGroup)
-				groups.DELETE("/:id", groupHandler.DeleteGroup)
-				groups.POST("/:id/members", groupHandler.AddMember)
-				groups.DELETE("/:id/members/:userId", groupHandler.RemoveMember)
-				groups.PUT("/:id/members/:userId/role", groupHandler.UpdateMemberRole)
+				groups.GET("/:groupId", groupHandler.GetGroup)
+				groups.PUT("/:groupId", groupHandler.UpdateGroup)
+				groups.DELETE("/:groupId", groupHandler.DeleteGroup)
+				groups.GET("/:groupId/members", groupHandler.GetGroupMembers)
+				groups.POST("/:groupId/members", groupHandler.AddMember)
+				groups.PUT("/:groupId/members/:userId", groupHandler.UpdateMemberRole)
+				groups.DELETE("/:groupId/members/:userId", groupHandler.RemoveMember)
+				groups.POST("/:groupId/leave", groupHandler.LeaveGroup)
+				groups.GET("/my", groupHandler.GetMyGroups)
+
+				// Member management actions
+				groups.POST("/:groupId/members/:userId/mute", groupHandler.MuteMember)
+				groups.DELETE("/:groupId/members/:userId/mute", groupHandler.UnmuteMember)
+				groups.POST("/:groupId/members/:userId/warn", groupHandler.WarnMember)
+				groups.POST("/:groupId/members/:userId/ban", groupHandler.BanMember)
+				groups.DELETE("/:groupId/members/:userId/ban", groupHandler.UnbanMember)
+
+				// Join requests
+				groups.GET("/:groupId/requests", groupHandler.GetJoinRequests)
+				groups.POST("/:groupId/join", groupHandler.RequestToJoin)
+				groups.POST("/:groupId/requests/:userId/approve", groupHandler.ApproveJoinRequest)
+				groups.POST("/:groupId/requests/:userId/reject", groupHandler.RejectJoinRequest)
+
+				// Invitations
+				groups.POST("/:groupId/invite", groupHandler.InviteUsers)
+				groups.GET("/:groupId/invites", groupHandler.GetPendingInvites)
+				groups.POST("/invites/:inviteId/accept", groupHandler.AcceptInvite)
+				groups.POST("/invites/:inviteId/decline", groupHandler.DeclineInvite)
+
+				// Group content
+				groups.GET("/:groupId/announcements", groupHandler.GetAnnouncements)
+				groups.POST("/:groupId/announcements", groupHandler.CreateAnnouncement)
+				groups.PUT("/:groupId/announcements/:announcementId", groupHandler.UpdateAnnouncement)
+				groups.DELETE("/:groupId/announcements/:announcementId", groupHandler.DeleteAnnouncement)
+
+				groups.GET("/:groupId/rules", groupHandler.GetGroupRules)
+				groups.POST("/:groupId/rules", groupHandler.CreateGroupRule)
+				groups.PUT("/:groupId/rules/:ruleId", groupHandler.UpdateGroupRule)
+				groups.DELETE("/:groupId/rules/:ruleId", groupHandler.DeleteGroupRule)
+
+				groups.GET("/:groupId/events", groupHandler.GetGroupEvents)
+				groups.POST("/:groupId/events", groupHandler.CreateGroupEvent)
+				groups.PUT("/:groupId/events/:eventId", groupHandler.UpdateGroupEvent)
+				groups.DELETE("/:groupId/events/:eventId", groupHandler.DeleteGroupEvent)
+				groups.POST("/:groupId/events/:eventId/attend", groupHandler.AttendEvent)
+
+				// Group discovery
+				groups.GET("/search", groupHandler.SearchGroups)
+				groups.GET("/public", groupHandler.GetPublicGroups)
+
+				// Group statistics
+				groups.GET("/:groupId/stats", groupHandler.GetGroupStats)
+
+				// Group settings
+				groups.GET("/:groupId/settings", groupHandler.GetGroupSettings)
+				groups.PUT("/:groupId/settings", groupHandler.UpdateGroupSettings)
+
+				// Invite links
+				groups.POST("/:groupId/invite-link", groupHandler.GenerateInviteLink)
+				groups.GET("/join/:inviteCode", groupHandler.JoinByInviteCode)
 			}
 
 			// Call routes
@@ -162,59 +215,161 @@ func main() {
 				calls.POST("/initiate", callHandler.InitiateCall)
 				calls.POST("/:id/answer", callHandler.AnswerCall)
 				calls.POST("/:id/end", callHandler.EndCall)
+				calls.POST("/:id/join", callHandler.JoinCall)
+				calls.POST("/:id/leave", callHandler.LeaveCall)
+				calls.GET("/:id", callHandler.GetCall)
 				calls.GET("/history", callHandler.GetCallHistory)
-				calls.POST("/:id/record/start", callHandler.StartRecording)
-				calls.POST("/:id/record/stop", callHandler.StopRecording)
+				calls.PUT("/:id/media", callHandler.UpdateMediaState)
+				calls.PUT("/:id/quality", callHandler.UpdateQualityMetrics)
+				calls.POST("/:id/recording/start", callHandler.StartRecording)
+				calls.POST("/:id/recording/stop", callHandler.StopRecording)
 			}
 
 			// File routes
 			files := protected.Group("/files")
 			{
 				files.POST("/upload", fileHandler.UploadFile)
-				files.GET("/:id", fileHandler.DownloadFile)
-				files.DELETE("/:id", fileHandler.DeleteFile)
-				files.GET("/:id/thumbnail", fileHandler.GetThumbnail)
+				files.GET("/:fileId", fileHandler.DownloadFile)
+				files.GET("/:fileId/download", fileHandler.DownloadFile)
+				files.GET("/:fileId/info", fileHandler.GetFileInfo)
+				files.GET("/:fileId/thumbnail", fileHandler.GetThumbnail)
+				files.DELETE("/:fileId", fileHandler.DeleteFile)
+				files.GET("/", fileHandler.GetUserFiles)
+				files.GET("/search", fileHandler.SearchFiles)
+				files.GET("/chat/:chatId", fileHandler.GetChatFiles)
+				files.GET("/stats", fileHandler.GetFileStats)
 			}
 
-			// Contact routes
-			contacts := protected.Group("/contacts")
+			// Device management routes
+			devices := protected.Group("/devices")
 			{
-				contacts.GET("", authHandler.GetContacts)
-				contacts.POST("", authHandler.AddContact)
-				contacts.DELETE("/:id", authHandler.RemoveContact)
-				contacts.POST("/:id/block", authHandler.BlockContact)
-				contacts.POST("/:id/unblock", authHandler.UnblockContact)
+				devices.GET("", authHandler.GetDevices)
 			}
+
+			// TODO: Add chat and message routes when services are implemented
+			// chats := protected.Group("/chats")
+			// messages := protected.Group("/messages")
 		}
 
 		// Admin routes
 		admin := api.Group("/admin")
 		admin.Use(middleware.AdminMiddleware(cfg.JWTSecret))
 		{
-			admin.GET("/users", adminHandler.GetUsers)
-			admin.GET("/users/:id", adminHandler.GetUser)
-			admin.PUT("/users/:id/status", adminHandler.UpdateUserStatus)
-			admin.GET("/chats", adminHandler.GetChats)
+			// Dashboard and analytics
+			admin.GET("/dashboard", adminHandler.GetDashboard)
 			admin.GET("/analytics", adminHandler.GetAnalytics)
-			admin.GET("/config", adminHandler.GetConfig)
-			admin.PUT("/config", adminHandler.UpdateConfig)
-			admin.GET("/logs", adminHandler.GetLogs)
-			admin.POST("/broadcast", adminHandler.SendBroadcast)
+			admin.GET("/stats", adminHandler.GetSystemStats)
+
+			// User management
+			users := admin.Group("/users")
+			{
+				users.GET("/", adminHandler.GetUsers)
+				users.GET("/:userId", adminHandler.GetUser)
+				users.PUT("/:userId", adminHandler.UpdateUser)
+				users.DELETE("/:userId", adminHandler.DeleteUser)
+				users.POST("/:userId/ban", adminHandler.BanUser)
+				users.DELETE("/:userId/ban", adminHandler.UnbanUser)
+				users.POST("/:userId/suspend", adminHandler.SuspendUser)
+				users.DELETE("/:userId/suspend", adminHandler.UnsuspendUser)
+				users.PUT("/:userId/role", adminHandler.UpdateUserRole)
+				users.GET("/:userId/activity", adminHandler.GetUserActivity)
+				users.POST("/:userId/reset-password", adminHandler.ResetUserPassword)
+				users.POST("/:userId/verify", adminHandler.VerifyUser)
+			}
+
+			// Content moderation
+			moderation := admin.Group("/moderation")
+			{
+				moderation.GET("/reports", adminHandler.GetReports)
+				moderation.GET("/reports/:reportId", adminHandler.GetReport)
+				moderation.PUT("/reports/:reportId", adminHandler.UpdateReport)
+				moderation.POST("/reports/:reportId/action", adminHandler.TakeAction)
+				moderation.GET("/messages", adminHandler.GetReportedMessages)
+				moderation.DELETE("/messages/:messageId", adminHandler.DeleteMessage)
+				moderation.PUT("/messages/:messageId/flag", adminHandler.FlagMessage)
+				moderation.GET("/groups", adminHandler.GetReportedGroups)
+				moderation.DELETE("/groups/:groupId", adminHandler.DeleteGroup)
+				moderation.PUT("/groups/:groupId/suspend", adminHandler.SuspendGroup)
+			}
+
+			// System management
+			system := admin.Group("/system")
+			{
+				system.GET("/health", adminHandler.GetSystemHealth)
+				system.GET("/logs", adminHandler.GetSystemLogs)
+				system.POST("/maintenance", adminHandler.SetMaintenanceMode)
+				system.POST("/broadcast", adminHandler.BroadcastMessage)
+				system.POST("/cleanup", adminHandler.RunCleanup)
+				system.GET("/config", adminHandler.GetSystemConfig)
+				system.PUT("/config", adminHandler.UpdateSystemConfig)
+			}
+
+			// File management
+			adminFiles := admin.Group("/files")
+			{
+				adminFiles.GET("/", adminHandler.GetFiles)
+				adminFiles.DELETE("/:fileId", adminHandler.DeleteFile)
+				adminFiles.GET("/stats", adminHandler.GetFileStats)
+				adminFiles.POST("/cleanup", adminHandler.CleanupFiles)
+				adminFiles.GET("/storage", adminHandler.GetStorageStats)
+			}
+
+			// Call management
+			adminCalls := admin.Group("/calls")
+			{
+				adminCalls.GET("/", adminHandler.GetCalls)
+				adminCalls.GET("/active", adminHandler.GetActiveCalls)
+				adminCalls.POST("/:callId/end", adminHandler.EndCall)
+				adminCalls.GET("/stats", adminHandler.GetCallStats)
+			}
+
+			// Security
+			security := admin.Group("/security")
+			{
+				security.GET("/sessions", adminHandler.GetActiveSessions)
+				security.DELETE("/sessions/:sessionId", adminHandler.TerminateSession)
+				security.GET("/failed-logins", adminHandler.GetFailedLogins)
+				security.POST("/ip-ban", adminHandler.BanIP)
+				security.DELETE("/ip-ban/:ip", adminHandler.UnbanIP)
+			}
 		}
+
+		// Call statistics endpoint (for admin)
+		api.GET("/stats/calls", middleware.AdminMiddleware(cfg.JWTSecret), func(c *gin.Context) {
+			stats := callService.GetCallStatistics()
+			c.JSON(http.StatusOK, gin.H{
+				"success": true,
+				"data":    stats,
+			})
+		})
 	}
 
-	// Health check
+	// Health check endpoint
 	router.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"status":    "ok",
 			"timestamp": time.Now().Unix(),
 			"version":   "1.0.0",
+			"services": gin.H{
+				"database":  "connected",
+				"redis":     "connected",
+				"websocket": "running",
+				"webrtc":    "running",
+			},
 		})
 	})
 
 	// Static files
 	router.Static("/static", "./web/static")
 	router.Static("/uploads", "./web/static/uploads")
+
+	// Admin interface
+	router.LoadHTMLFiles("web/admin/index.html")
+	router.GET("/", func(c *gin.Context) {
+		c.HTML(http.StatusOK, "index.html", gin.H{
+			"title": "BRO Chat Admin",
+		})
+	})
 
 	// Start server
 	srv := &http.Server{
@@ -248,92 +403,4 @@ func main() {
 	}
 
 	log.Println("Server exited")
-}
-
-func setupSocketIO(hub *websocket.Hub, rtcManager *webrtc.Manager, cfg *config.Config) *socketio.Server {
-	server := socketio.NewServer(&engineio.Options{
-		Transports: []transport.Transport{
-			&polling.Transport{
-				CheckOrigin: func(r *http.Request) bool {
-					return true
-				},
-			},
-			&websocket.Transport{
-				CheckOrigin: func(r *http.Request) bool {
-					return true
-				},
-			},
-		},
-	})
-
-	server.OnConnect("/", func(s socketio.Conn) error {
-		log.Printf("Socket connected: %s", s.ID())
-		return nil
-	})
-
-	server.OnError("/", func(s socketio.Conn, e error) {
-		log.Printf("Socket error: %v", e)
-	})
-
-	server.OnDisconnect("/", func(s socketio.Conn, reason string) {
-		log.Printf("Socket disconnected: %s, reason: %s", s.ID(), reason)
-		hub.UnregisterClient(s.ID())
-	})
-
-	// Chat events
-	server.OnEvent("/", "join_chat", func(s socketio.Conn, data map[string]interface{}) {
-		hub.JoinChat(s.ID(), data)
-	})
-
-	server.OnEvent("/", "leave_chat", func(s socketio.Conn, data map[string]interface{}) {
-		hub.LeaveChat(s.ID(), data)
-	})
-
-	server.OnEvent("/", "send_message", func(s socketio.Conn, data map[string]interface{}) {
-		hub.BroadcastMessage(s.ID(), data)
-	})
-
-	server.OnEvent("/", "typing_start", func(s socketio.Conn, data map[string]interface{}) {
-		hub.BroadcastTyping(s.ID(), data, true)
-	})
-
-	server.OnEvent("/", "typing_stop", func(s socketio.Conn, data map[string]interface{}) {
-		hub.BroadcastTyping(s.ID(), data, false)
-	})
-
-	// WebRTC signaling events
-	server.OnEvent("/", "call_offer", func(s socketio.Conn, data map[string]interface{}) {
-		rtcManager.HandleOffer(s.ID(), data)
-	})
-
-	server.OnEvent("/", "call_answer", func(s socketio.Conn, data map[string]interface{}) {
-		rtcManager.HandleAnswer(s.ID(), data)
-	})
-
-	server.OnEvent("/", "ice_candidate", func(s socketio.Conn, data map[string]interface{}) {
-		rtcManager.HandleICECandidate(s.ID(), data)
-	})
-
-	server.OnEvent("/", "call_end", func(s socketio.Conn, data map[string]interface{}) {
-		rtcManager.HandleCallEnd(s.ID(), data)
-	})
-
-	// Video/Audio control events
-	server.OnEvent("/", "toggle_video", func(s socketio.Conn, data map[string]interface{}) {
-		rtcManager.ToggleVideo(s.ID(), data)
-	})
-
-	server.OnEvent("/", "toggle_audio", func(s socketio.Conn, data map[string]interface{}) {
-		rtcManager.ToggleAudio(s.ID(), data)
-	})
-
-	server.OnEvent("/", "screen_share_start", func(s socketio.Conn, data map[string]interface{}) {
-		rtcManager.StartScreenShare(s.ID(), data)
-	})
-
-	server.OnEvent("/", "screen_share_stop", func(s socketio.Conn, data map[string]interface{}) {
-		rtcManager.StopScreenShare(s.ID(), data)
-	})
-
-	return server
 }
