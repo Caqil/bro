@@ -10,7 +10,23 @@ const compat = new FlatCompat({
 });
 
 const eslintConfig = [
-  ...compat.extends("next/core-web-vitals", "next/typescript"),
+  ...compat.extends("next/core-web-vitals", "next/typescript",
+    {
+      files: ["**/*.ts", "**/*.tsx"],
+      rules: {
+        "@typescript-eslint/no-explicit-any": "off",
+        "@typescript-eslint/no-unused-vars": [
+          "warn",
+          {
+            argsIgnorePattern: "^_",
+            varsIgnorePattern: "^_",
+          },
+        ],
+        "no-console": "warn",
+        "react/react-in-jsx-scope": "off", // Next.js handles React import automatically
+      },
+    }
+  ),
 ];
 
 export default eslintConfig;
