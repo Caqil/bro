@@ -67,7 +67,7 @@ export async function POST(request: NextRequest) {
       userId,
       deviceId,
       logoutType,
-    }, { req: request });
+    } );
 
     logger.info('User logged out successfully', {
       userId,
@@ -82,7 +82,7 @@ export async function POST(request: NextRequest) {
 
   } catch (error) {
     logger.error('Logout endpoint error', error);
-    analyticsService.trackError(error as Error, { req: request });
+    analyticsService.trackError(error as Error );
     
     return NextResponse.json(
       { error: 'Internal server error' },

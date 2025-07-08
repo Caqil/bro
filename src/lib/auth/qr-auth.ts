@@ -68,7 +68,7 @@ export class QRAuthService {
     try {
       // Generate unique QR ID and secret
       const qrId = CryptoUtils.generateUUID();
-      const secret = CryptoUtils.generateSecureToken(32);
+      const secret = CryptoUtils.generateRandomString(32);
       
       // Create session
       const session: QRAuthSession = {

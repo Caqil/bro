@@ -34,7 +34,7 @@ export async function POST(request: NextRequest) {
     if (!refreshResult.valid || !refreshResult.payload) {
       analyticsService.track('refresh_token_invalid', {
         error: refreshResult.error,
-      }, { req: request });
+      });
 
       return NextResponse.json(
         { error: refreshResult.error || 'Invalid refresh token' },
@@ -64,7 +64,7 @@ export async function POST(request: NextRequest) {
       analyticsService.track('refresh_token_banned_user', {
         userId,
         banReason: user.banReason,
-      }, { req: request });
+      });
 
       return NextResponse.json(
         { error: 'Account has been suspended' },
@@ -85,7 +85,7 @@ export async function POST(request: NextRequest) {
     analyticsService.track('token_refreshed', {
       userId,
       deviceId,
-    }, { req: request });
+    });
 
     logger.debug('Tokens refreshed successfully', {
       userId,
@@ -103,7 +103,7 @@ export async function POST(request: NextRequest) {
 
   } catch (error) {
     logger.error('Token refresh endpoint error', error);
-    analyticsService.trackError(error as Error, { req: request });
+    analyticsService.trackError(error as Error);
     
     return NextResponse.json(
       { error: 'Internal server error' },

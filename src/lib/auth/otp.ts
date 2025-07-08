@@ -213,7 +213,7 @@ export class OTPService {
   }
 
   // Verify OTP
-  async verifyOTP(
+ async verifyOTP(
     identifier: string,
     code: string,
     purpose: string
@@ -257,7 +257,7 @@ export class OTPService {
       if (!isValid) {
         const attemptsRemaining = record.maxAttempts - (record.attempts + 1);
         
-        logger.warn('Invalid OTP attempt', {
+        console.warn('Invalid OTP attempt:', {
           identifier: fullIdentifier,
           attempts: record.attempts + 1,
           attemptsRemaining,
@@ -273,15 +273,13 @@ export class OTPService {
       // Valid OTP - clean up
       await this.deleteOTP(fullIdentifier);
 
-      logger.info('OTP verified successfully', {
-        identifier: fullIdentifier,
-      });
+      console.log('✅ OTP verified successfully');
 
       return {
         success: true,
       };
     } catch (error) {
-      logger.error('Error verifying OTP', error, { identifier, purpose });
+      console.error('Error verifying OTP:', error);
       return {
         success: false,
         error: 'OTP verification failed',
@@ -415,7 +413,7 @@ export class OTPService {
       if (ttl > 0) {
         return {
           allowed: false,
-          cooldownUntil: DateUtils.addSeconds(new Date(), ttl),
+          cooldownUntil: DateUtils.addHours(new Date(), ttl),
         };
       }
 

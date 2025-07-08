@@ -8,6 +8,7 @@ import { logger } from '@/lib/monitoring/logging';
 import { analyticsService } from '@/lib/monitoring/analytics';
 import { CryptoUtils } from '@/lib/utils/crypto';
 import connectDB from '@/lib/database/mongodb';
+import { authMiddleware } from '@/lib/auth/middleware';
 
 export async function POST(request: NextRequest) {
   try {
@@ -63,15 +64,15 @@ export async function POST(request: NextRequest) {
         userId: user._id.toString(),
         phoneNumber: sanitizedPhoneNumber,
         method: otpMethod,
-        error: otpResult.error,
+        error: otpResult.error ? { name: 'OTPVerificationError', message: otpResult.error } : undefined,
         attemptsRemaining: otpResult.attemptsRemaining,
-      }, { req: request });
+      } );
 
       logger.warn('Login OTP verification failed', {
         userId: user._id.toString(),
         phoneNumber: sanitizedPhoneNumber,
         method: otpMethod,
-        error: otpResult.error,
+        error: otpResult.error ? { name: 'OTPVerificationError', message: otpResult.error } : undefined,
         attemptsRemaining: otpResult.attemptsRemaining,
       });
 
@@ -94,7 +95,7 @@ export async function POST(request: NextRequest) {
     const tokens = jwtService.generateTokenPair(user, deviceId);
 
     // Track successful login
-    analyticsService.trackUserLogin(user, 'otp', request);
+    analyticsService.trackUserLogin(user, 'otp');
 
     logger.info('User login completed successfully', {
       userId: user._id.toString(),
@@ -127,7 +128,7 @@ export async function POST(request: NextRequest) {
 
   } catch (error) {
     logger.error('Login OTP verification endpoint error', error);
-    analyticsService.trackError(error as Error, { req: request });
+    analyticsService.trackError(error as Error );
     
     return NextResponse.json(
       { error: 'Internal server error' },

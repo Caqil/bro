@@ -22,7 +22,7 @@ export async function GET(request: NextRequest) {
       qrId: qrResult.qrId,
       platform: 'web',
       userAgent,
-    }, { req: request });
+    } );
 
     logger.info('QR code generated for web login', {
       qrId: qrResult.qrId,
@@ -39,7 +39,7 @@ export async function GET(request: NextRequest) {
 
   } catch (error) {
     logger.error('QR generation endpoint error', error);
-    analyticsService.trackError(error as Error, { req: request });
+    analyticsService.trackError(error as Error );
     
     return NextResponse.json(
       { error: 'Failed to generate QR code' },

@@ -2,6 +2,7 @@ import winston from 'winston';
 import { Request } from 'express';
 
 interface LogContext {
+  // Core request context
   userId?: string;
   sessionId?: string;
   requestId?: string;
@@ -11,11 +12,45 @@ interface LogContext {
   url?: string;
   statusCode?: number;
   responseTime?: number;
+  
+  // Authentication context
+  jti?: string; // JWT ID
+  deviceId?: string;
+  phoneNumber?: string;
+  email?: string;
+  
+  // Call context
+  callId?: string;
+  qrId?: string;
+  platform?: string;
+  
+  // Message/Chat context
+  messageId?: string;
+  chatId?: string;
+  groupId?: string;
+  
+  // User management context
+  banReason?: string;
+  attemptsRemaining?: number;
+  cooldownUntil?: Date;
+  expiresAt?: Date;
+  
+  // OTP context
+  otpMethod?: string;
+  
+  // File context
+  fileType?: string;
+  fileSize?: number;
+  
+  // Error context
   error?: {
     name: string;
     message: string;
     stack?: string;
   };
+  
+  // Allow any additional properties for flexibility
+  [key: string]: any;
 }
 
 interface LogEntry {
@@ -103,16 +138,34 @@ export class Logger {
     this.winston.warn(message, { context });
   }
 
-  // Error level logging
-  error(message: string, error?: Error, context?: LogContext): void {
+  // Error level logging with improved error handling
+  error(message: string, error?: unknown, context?: LogContext): void {
     const logContext = { ...context };
     
     if (error) {
-      logContext.error = {
-        name: error.name,
-        message: error.message,
-        stack: error.stack,
-      };
+      // Handle different types of error objects
+      if (error instanceof Error) {
+        logContext.error = {
+          name: error.name,
+          message: error.message,
+          stack: error.stack,
+        };
+      } else if (typeof error === 'string') {
+        logContext.error = {
+          name: 'StringError',
+          message: error,
+        };
+      } else if (typeof error === 'object' && error !== null) {
+        logContext.error = {
+          name: 'UnknownError',
+          message: JSON.stringify(error),
+        };
+      } else {
+        logContext.error = {
+          name: 'UnknownError',
+          message: String(error),
+        };
+      }
     }
 
     this.winston.error(message, { context: logContext });
@@ -133,7 +186,7 @@ export class Logger {
       url: req.originalUrl,
       statusCode,
       responseTime,
-      userId: (req as any).user?.id,
+      userId: (req as any).user?.userId || (req as any).user?.id,
     };
 
     const level = statusCode >= 400 ? 'warn' : 'info';
@@ -143,7 +196,7 @@ export class Logger {
   }
 
   // User action logging
-  logUserAction(action: string, userId: string, details?: any): void {
+  logUserAction(action: string, userId: string, details?: LogContext): void {
     this.info(`User action: ${action}`, {
       userId,
       ...details,
@@ -156,34 +209,72 @@ export class Logger {
   }
 
   // Database operation logging
-  logDatabaseOperation(operation: string, collection: string, duration: number, error?: Error): void {
+  logDatabaseOperation(operation: string, collection: string, duration: number, error?: unknown): void {
     if (error) {
       this.error(`Database operation failed: ${operation} on ${collection}`, error, {
         responseTime: duration,
+        operation,
+        collection,
       });
     } else {
-      this.debug(`Database operation: ${operation} on ${collection} - ${duration}ms`);
+      this.debug(`Database operation: ${operation} on ${collection} - ${duration}ms`, {
+        operation,
+        collection,
+        responseTime: duration,
+      });
     }
   }
 
   // External service logging
   logExternalService(service: string, operation: string, duration: number, success: boolean): void {
     const message = `External service ${service}: ${operation} - ${duration}ms`;
+    const context: LogContext = {
+      service,
+      operation,
+      responseTime: duration,
+      success,
+    };
     
     if (success) {
-      this.info(message);
+      this.info(message, context);
     } else {
-      this.warn(`${message} - FAILED`);
+      this.warn(`${message} - FAILED`, context);
     }
   }
 
   // Performance logging
   logPerformance(operation: string, duration: number, context?: LogContext): void {
+    const logContext: LogContext = {
+      operation,
+      responseTime: duration,
+      ...context,
+    };
+
     if (duration > 1000) { // Log slow operations (> 1s)
-      this.warn(`Slow operation: ${operation} - ${duration}ms`, context);
+      this.warn(`Slow operation: ${operation} - ${duration}ms`, logContext);
     } else {
-      this.debug(`Performance: ${operation} - ${duration}ms`, context);
+      this.debug(`Performance: ${operation} - ${duration}ms`, logContext);
     }
+  }
+
+  // Authentication logging
+  logAuth(event: string, context: LogContext): void {
+    this.info(`Auth event: ${event}`, context);
+  }
+
+  // OTP logging
+  logOTP(event: string, context: LogContext): void {
+    this.info(`OTP event: ${event}`, context);
+  }
+
+  // Call logging
+  logCall(event: string, context: LogContext): void {
+    this.info(`Call event: ${event}`, context);
+  }
+
+  // Media logging
+  logMedia(event: string, context: LogContext): void {
+    this.info(`Media event: ${event}`, context);
   }
 
   // Create child logger with default context
@@ -202,13 +293,50 @@ export class Logger {
     childLogger.warn = (message: string, context?: LogContext) => 
       originalWarn(message, { ...defaultContext, ...context });
     
-    childLogger.error = (message: string, error?: Error, context?: LogContext) => 
+    childLogger.error = (message: string, error?: unknown, context?: LogContext) => 
       originalError(message, error, { ...defaultContext, ...context });
     
     childLogger.debug = (message: string, context?: LogContext) => 
       originalDebug(message, { ...defaultContext, ...context });
 
     return childLogger;
+  }
+
+  // Structured logging for specific events
+  logEvent(event: string, level: 'info' | 'warn' | 'error' | 'debug' = 'info', context?: LogContext): void {
+    this[level](`Event: ${event}`, context);
+  }
+
+  // Helper method for sanitizing sensitive data in logs
+  private sanitizeContext(context: LogContext): LogContext {
+    const sanitized = { ...context };
+    
+    // Remove or mask sensitive data
+    if (sanitized.phoneNumber) {
+      sanitized.phoneNumber = this.maskPhoneNumber(sanitized.phoneNumber);
+    }
+    
+    if (sanitized.email) {
+      sanitized.email = this.maskEmail(sanitized.email);
+    }
+    
+    // Remove sensitive tokens (keep only first/last few characters)
+    if (sanitized.jti && sanitized.jti.length > 8) {
+      sanitized.jti = sanitized.jti.substring(0, 4) + '***' + sanitized.jti.slice(-4);
+    }
+    
+    return sanitized;
+  }
+
+  private maskPhoneNumber(phone: string): string {
+    if (phone.length <= 4) return phone;
+    return phone.substring(0, 2) + '*'.repeat(phone.length - 4) + phone.slice(-2);
+  }
+
+  private maskEmail(email: string): string {
+    const [username, domain] = email.split('@');
+    if (username.length <= 2) return email;
+    return username.charAt(0) + '*'.repeat(username.length - 2) + username.charAt(username.length - 1) + '@' + domain;
   }
 }
 
@@ -235,3 +363,6 @@ export function requestLoggingMiddleware() {
     next();
   };
 }
+
+// Export types for use in other modules
+export type { LogContext, LogEntry };

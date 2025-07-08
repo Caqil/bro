@@ -2,9 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { UserRepository } from '@/lib/database/repositories/user';
 import { registerSchema } from '@/lib/database/schemas/auth';
 import { otpService } from '@/lib/auth/otp';
-import { validateBody } from '@/lib/security/validation';
 import { DataSanitizer } from '@/lib/security/sanitization';
-import { ErrorHandler } from '@/lib/utils/error-handler';
 import { logger } from '@/lib/monitoring/logging';
 import { analyticsService } from '@/lib/monitoring/analytics';
 import { authMiddleware } from '@/lib/auth/middleware';
@@ -50,7 +48,7 @@ export async function POST(request: NextRequest) {
       analyticsService.track('registration_attempt_existing_user', {
         phoneNumber: sanitizedData.phoneNumber,
         hasEmail: !!sanitizedData.email,
-      }, { req: request });
+      });
 
       return NextResponse.json(
         { error: 'User with this phone number already exists' },
@@ -112,7 +110,7 @@ export async function POST(request: NextRequest) {
       phoneNumber: sanitizedData.phoneNumber,
       hasEmail: !!sanitizedData.email,
       method: otpMethod,
-    }, { req: request });
+    });
 
     logger.info('Registration initiated successfully', {
       phoneNumber: sanitizedData.phoneNumber,
@@ -129,7 +127,7 @@ export async function POST(request: NextRequest) {
 
   } catch (error) {
     logger.error('Registration endpoint error', error);
-    analyticsService.trackError(error as Error, { req: request });
+    analyticsService.trackError(error as Error);
     
     return NextResponse.json(
       { error: 'Internal server error' },

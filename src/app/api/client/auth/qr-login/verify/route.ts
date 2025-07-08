@@ -37,7 +37,7 @@ export async function POST(request: NextRequest) {
         if (result.success) {
           analyticsService.track('qr_login_scanned', {
             userId,
-          }, { req: request });
+          });
         }
         
         break;
@@ -52,7 +52,7 @@ export async function POST(request: NextRequest) {
           analyticsService.track('qr_login_confirmed', {
             userId,
             qrId,
-          }, { req: request });
+          });
         }
         
         break;
@@ -66,7 +66,7 @@ export async function POST(request: NextRequest) {
           analyticsService.track('qr_login_rejected', {
             userId,
             qrId: rejectQrId,
-          }, { req: request });
+          });
         }
         
         break;
@@ -97,7 +97,7 @@ export async function POST(request: NextRequest) {
 
   } catch (error) {
     logger.error('QR verify endpoint error', error);
-    analyticsService.trackError(error as Error, { req: request });
+    analyticsService.trackError(error as Error);
     
     return NextResponse.json(
       { error: 'Internal server error' },

@@ -8,6 +8,7 @@ import { logger } from '@/lib/monitoring/logging';
 import { analyticsService } from '@/lib/monitoring/analytics';
 import { CryptoUtils } from '@/lib/utils/crypto';
 import connectDB from '@/lib/database/mongodb';
+import { authMiddleware } from '@/lib/auth/middleware';
 
 export async function POST(request: NextRequest) {
   try {
@@ -55,12 +56,14 @@ export async function POST(request: NextRequest) {
         method,
         error: otpResult.error,
         attemptsRemaining: otpResult.attemptsRemaining,
-      }, { req: request });
+      } );
 
       logger.warn('OTP verification failed', {
         phoneNumber: sanitizedPhoneNumber,
         method,
-        error: otpResult.error,
+        error: otpResult.error
+          ? { name: 'OTPError', message: otpResult.error }
+          : undefined,
         attemptsRemaining: otpResult.attemptsRemaining,
       });
 
@@ -101,7 +104,7 @@ export async function POST(request: NextRequest) {
     const tokens = jwtService.generateTokenPair(user, deviceId);
 
     // Track successful registration
-    analyticsService.trackUserRegistration(user, request);
+    analyticsService.trackUserRegistration(user);
 
     logger.info('User registration completed successfully', {
       userId: user._id.toString(),
@@ -130,7 +133,7 @@ export async function POST(request: NextRequest) {
 
   } catch (error) {
     logger.error('OTP verification endpoint error', error);
-    analyticsService.trackError(error as Error, { req: request });
+    analyticsService.trackError(error as Error );
     
     return NextResponse.json(
       { error: 'Internal server error' },

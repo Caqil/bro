@@ -6,6 +6,7 @@ import { DataSanitizer } from '@/lib/security/sanitization';
 import { logger } from '@/lib/monitoring/logging';
 import { analyticsService } from '@/lib/monitoring/analytics';
 import connectDB from '@/lib/database/mongodb';
+import { authMiddleware } from '@/lib/auth/middleware';
 
 export async function POST(request: NextRequest) {
   try {
@@ -39,7 +40,7 @@ export async function POST(request: NextRequest) {
       // Track login attempt for non-existent user
       analyticsService.track('login_attempt_non_existent_user', {
         phoneNumber: sanitizedPhoneNumber,
-      }, { req: request });
+      } );
 
       return NextResponse.json(
         { error: 'User not found. Please register first.' },
@@ -53,7 +54,7 @@ export async function POST(request: NextRequest) {
         userId: user._id.toString(),
         phoneNumber: sanitizedPhoneNumber,
         banReason: user.banReason,
-      }, { req: request });
+      } );
 
       logger.warn('Login attempt by banned user', {
         userId: user._id.toString(),
@@ -105,7 +106,7 @@ export async function POST(request: NextRequest) {
       userId: user._id.toString(),
       phoneNumber: sanitizedPhoneNumber,
       method: otpMethod,
-    }, { req: request });
+    } );
 
     logger.info('Login OTP sent successfully', {
       userId: user._id.toString(),
@@ -128,7 +129,7 @@ export async function POST(request: NextRequest) {
 
   } catch (error) {
     logger.error('Login endpoint error', error);
-    analyticsService.trackError(error as Error, { req: request });
+    analyticsService.trackError(error as Error );
     
     return NextResponse.json(
       { error: 'Internal server error' },

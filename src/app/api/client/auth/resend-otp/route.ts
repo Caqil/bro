@@ -6,6 +6,7 @@ import { logger } from '@/lib/monitoring/logging';
 import { analyticsService } from '@/lib/monitoring/analytics';
 import { authMiddleware } from '@/lib/auth/middleware';
 import connectDB from '@/lib/database/mongodb';
+import { IUser } from '@/lib/database/models/user';
 
 export async function POST(request: NextRequest) {
   try {
@@ -22,7 +23,7 @@ export async function POST(request: NextRequest) {
     }
 
     const userRepository = new UserRepository();
-    let user = null;
+    let user: IUser | null = null;
     let identifier = '';
     let method = '';
 
@@ -107,7 +108,7 @@ export async function POST(request: NextRequest) {
       identifier: method === 'email' ? identifier : phoneNumber,
       method,
       purpose,
-    }, { req: request });
+    });
 
     logger.info('OTP resent successfully', {
       userId: user?._id.toString(),
@@ -126,7 +127,7 @@ export async function POST(request: NextRequest) {
 
   } catch (error) {
     logger.error('Resend OTP endpoint error', error);
-    analyticsService.trackError(error as Error, { req: request });
+    analyticsService.trackError(error as Error );
     
     return NextResponse.json(
       { error: 'Internal server error' },

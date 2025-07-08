@@ -1,6 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { logger } from './lib/monitoring/logging';
-import { corsConfig } from './lib/config/cors';
+import { edgeLogger } from './lib/monitoring/edge-logger'; // Use edge logger
 import { environmentConfig } from './lib/config/environment';
 
 export function middleware(request: NextRequest) {
@@ -22,24 +21,19 @@ export function middleware(request: NextRequest) {
   }
   
   // Add monitoring headers
-  response.headers.set('X-Response-Time', `${Date.now() - startTime}ms`);
-  response.headers.set('X-API-Version', environmentConfig.getValue('APP_VERSION'));
+  const responseTime = Date.now() - startTime;
+  response.headers.set('X-Response-Time', `${responseTime}ms`);
+  response.headers.set('X-API-Version', process.env.APP_VERSION || '1.0.0');
   
-  // Log request (in production, this might be too verbose)
-  if (environmentConfig.isDevelopment()) {
-    logger.info(`${request.method} ${request.nextUrl.pathname}`, {
-      requestId,
-      ip: getClientIP(request),
-      userAgent: request.headers.get('user-agent') || undefined,
-    });
+  // Log request using edge logger
+  if (process.env.NODE_ENV === 'development') {
+    edgeLogger.logRequest(request, response.status || 200, responseTime);
   }
   
   return response;
 }
 
 function addSecurityHeaders(response: NextResponse) {
-  const env = environmentConfig.get();
-  
   // Content Security Policy
   const csp = [
     "default-src 'self'",
@@ -57,27 +51,11 @@ function addSecurityHeaders(response: NextResponse) {
   
   // Security headers
   const securityHeaders = {
-    // Content Security Policy
     'Content-Security-Policy': csp,
-    
-    // Prevent MIME type sniffing
     'X-Content-Type-Options': 'nosniff',
-    
-    // XSS Protection
     'X-XSS-Protection': '1; mode=block',
-    
-    // Clickjacking protection
     'X-Frame-Options': 'DENY',
-    
-    // HTTPS enforcement (only in production)
-    ...(env.NODE_ENV === 'production' && {
-      'Strict-Transport-Security': 'max-age=31536000; includeSubDomains; preload',
-    }),
-    
-    // Referrer policy
     'Referrer-Policy': 'strict-origin-when-cross-origin',
-    
-    // Feature policy
     'Permissions-Policy': [
       'camera=(self)',
       'microphone=(self)',
@@ -88,10 +66,13 @@ function addSecurityHeaders(response: NextResponse) {
       'gyroscope=()',
       'accelerometer=()',
     ].join(', '),
-    
-    // Server information hiding
     'X-Powered-By': 'ChatApp',
   };
+  
+  // Add HTTPS enforcement in production
+  if (process.env.NODE_ENV === 'production') {
+    securityHeaders['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains; preload';
+  }
   
   Object.entries(securityHeaders).forEach(([key, value]) => {
     response.headers.set(key, value);
@@ -100,7 +81,7 @@ function addSecurityHeaders(response: NextResponse) {
 
 function handleCORS(request: NextRequest, response: NextResponse) {
   const origin = request.headers.get('origin');
-  const corsHeaders = corsConfig.getCorsHeaders(origin || undefined);
+  const corsHeaders = getCorsHeaders(origin || undefined);
   
   // Add CORS headers
   Object.entries(corsHeaders).forEach(([key, value]) => {
@@ -116,37 +97,35 @@ function handleCORS(request: NextRequest, response: NextResponse) {
   }
 }
 
-function getClientIP(request: NextRequest): string {
-  // Check various headers for the real IP
-  const xForwardedFor = request.headers.get('x-forwarded-for');
-  if (xForwardedFor) {
-    return xForwardedFor.split(',')[0].trim();
+function getCorsHeaders(origin?: string): Record<string, string> {
+  const headers: Record<string, string> = {};
+  
+  // Simple CORS for development
+  if (process.env.NODE_ENV === 'development') {
+    headers['Access-Control-Allow-Origin'] = '*';
+  } else if (origin) {
+    // Add your production origins here
+    const allowedOrigins = [
+      process.env.FRONTEND_URL,
+      process.env.WEBSITE_URL,
+    ].filter(Boolean);
+    
+    if (allowedOrigins.includes(origin)) {
+      headers['Access-Control-Allow-Origin'] = origin;
+    }
   }
   
-  const xRealIP = request.headers.get('x-real-ip');
-  if (xRealIP) {
-    return xRealIP;
-  }
+  headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, PATCH, OPTIONS';
+  headers['Access-Control-Allow-Headers'] = 'Origin, X-Requested-With, Content-Type, Accept, Authorization, X-Request-ID';
+  headers['Access-Control-Allow-Credentials'] = 'true';
+  headers['Access-Control-Max-Age'] = '86400';
   
-  const cfConnectingIP = request.headers.get('cf-connecting-ip');
-  if (cfConnectingIP) {
-    return cfConnectingIP;
-  }
-  
-  // Fallback to a default IP
-  return '127.0.0.1';
+  return headers;
 }
 
 // Configuration for middleware
 export const config = {
   matcher: [
-    /*
-     * Match all request paths except for the ones starting with:
-     * - _next/static (static files)
-     * - _next/image (image optimization files)
-     * - favicon.ico (favicon file)
-     * - public folder
-     */
     '/((?!_next/static|_next/image|favicon.ico|public).*)',
   ],
 };

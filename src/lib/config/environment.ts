@@ -1,84 +1,94 @@
 import { z } from 'zod';
-import { logger } from '../monitoring/logging';
 
-// Environment schema validation
-const envSchema = z.object({
-  // Application
-  NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
-  PORT: z.string().transform(Number).default('3000'),
-  APP_VERSION: z.string().default('1.0.0'),
-  APP_NAME: z.string().default('ChatApp'),
-  
-  // URLs
-  FRONTEND_URL: z.string().url().default('http://localhost:3000'),
-  API_URL: z.string().url().default('http://localhost:3000/api'),
-  WEBSITE_URL: z.string().url().default('https://chatapp.com'),
-  
-  // Database
-  MONGODB_URI: z.string().min(1, 'MongoDB URI is required'),
-  
-  // Redis (optional)
-  REDIS_URL: z.string().optional(),
-  
-  // JWT
-  JWT_SECRET: z.string().min(32, 'JWT secret must be at least 32 characters'),
-  JWT_EXPIRES_IN: z.string().default('7d'),
-  REFRESH_TOKEN_SECRET: z.string().min(32, 'Refresh token secret must be at least 32 characters'),
-  REFRESH_TOKEN_EXPIRES_IN: z.string().default('30d'),
-  
-  // AWS S3
-  AWS_REGION: z.string().default('us-east-1'),
-  AWS_ACCESS_KEY_ID: z.string().min(1, 'AWS Access Key ID is required'),
-  AWS_SECRET_ACCESS_KEY: z.string().min(1, 'AWS Secret Access Key is required'),
-  AWS_S3_BUCKET: z.string().min(1, 'AWS S3 bucket is required'),
-  AWS_S3_ENDPOINT: z.string().optional(),
-  
-  // SMTP
-  SMTP_HOST: z.string().default('smtp.gmail.com'),
-  SMTP_PORT: z.string().transform(Number).default('587'),
-  SMTP_SECURE: z.string().transform(val => val === 'true').default('false'),
-  SMTP_USER: z.string().min(1, 'SMTP user is required'),
-  SMTP_PASS: z.string().min(1, 'SMTP password is required'),
-  SMTP_FROM: z.string().email().default('noreply@chatapp.com'),
-  SMTP_REPLY_TO: z.string().email().optional(),
-  
-  // Twilio (SMS)
-  TWILIO_ACCOUNT_SID: z.string().min(1, 'Twilio Account SID is required'),
-  TWILIO_AUTH_TOKEN: z.string().min(1, 'Twilio Auth Token is required'),
-  TWILIO_FROM_NUMBER: z.string().min(1, 'Twilio From Number is required'),
-  
-  // Firebase (Push Notifications)
-  FIREBASE_PROJECT_ID: z.string().min(1, 'Firebase Project ID is required'),
-  FIREBASE_PRIVATE_KEY: z.string().min(1, 'Firebase Private Key is required'),
-  FIREBASE_CLIENT_EMAIL: z.string().email('Firebase Client Email must be valid'),
-  
-  // CoTURN
-  COTURN_PRIMARY_HOST: z.string().default('turn.example.com'),
-  COTURN_SECRET: z.string().min(1, 'CoTURN secret is required'),
-  COTURN_REALM: z.string().default('chatapp.com'),
-  COTURN_TTL: z.string().transform(Number).default('86400'),
-  COTURN_FALLBACK_HOSTS: z.string().optional(),
-  
-  // Logging
-  LOG_LEVEL: z.enum(['error', 'warn', 'info', 'debug']).default('info'),
-  
-  // Rate Limiting
-  RATE_LIMIT_REDIS_URL: z.string().optional(),
-  RATE_LIMIT_WINDOW_MS: z.string().transform(Number).default('900000'), // 15 minutes
-  RATE_LIMIT_MAX_REQUESTS: z.string().transform(Number).default('100'),
-  
-  // Security
-  ENCRYPTION_KEY: z.string().min(64, 'Encryption key must be at least 64 characters'),
-  CORS_ORIGIN: z.string().optional(),
-  ALLOWED_ORIGINS: z.string().optional(),
-  
-  // Monitoring
-  ANALYTICS_ENABLED: z.string().transform(val => val === 'true').default('true'),
-  METRICS_ENABLED: z.string().transform(val => val === 'true').default('true'),
-  HEALTH_CHECK_ENABLED: z.string().transform(val => val === 'true').default('true'),
-});
+// Create conditional schema based on environment
+const createEnvSchema = (isDevelopment: boolean) => {
+  const requiredInProduction = (schema: z.ZodSchema) => 
+    isDevelopment ? schema.optional() : schema;
 
-export type Environment = z.infer<typeof envSchema>;
+  return z.object({
+    // Application
+    NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
+    PORT: z.string().transform(Number).default('3000'),
+    APP_VERSION: z.string().default('1.0.0'),
+    APP_NAME: z.string().default('ChatApp'),
+    
+    // URLs
+    FRONTEND_URL: z.string().url().default('http://localhost:3000'),
+    API_URL: z.string().url().default('http://localhost:3000/api'),
+    WEBSITE_URL: z.string().url().default('https://chatapp.com'),
+    
+    // Database (always required)
+    MONGODB_URI: z.string().min(1, 'MongoDB URI is required'),
+    
+    // Redis (optional)
+    REDIS_URL: z.string().optional(),
+    
+    // JWT (always required but with defaults in dev)
+    JWT_SECRET: isDevelopment 
+      ? z.string().default('dev-jwt-secret-key-min-32-characters-long-for-development-only')
+      : z.string().min(32, 'JWT secret must be at least 32 characters'),
+    JWT_EXPIRES_IN: z.string().default('7d'),
+    REFRESH_TOKEN_SECRET: isDevelopment
+      ? z.string().default('dev-refresh-secret-key-min-32-characters-long-for-development-only')
+      : z.string().min(32, 'Refresh token secret must be at least 32 characters'),
+    REFRESH_TOKEN_EXPIRES_IN: z.string().default('30d'),
+    
+    // AWS S3 (optional in dev)
+    AWS_REGION: z.string().default('us-east-1'),
+    AWS_ACCESS_KEY_ID: requiredInProduction(z.string().default('dev-access-key')),
+    AWS_SECRET_ACCESS_KEY: requiredInProduction(z.string().default('dev-secret-key')),
+    AWS_S3_BUCKET: requiredInProduction(z.string().default('dev-bucket')),
+    AWS_S3_ENDPOINT: z.string().optional(),
+    
+    // SMTP (optional in dev)
+    SMTP_HOST: z.string().default('smtp.gmail.com'),
+    SMTP_PORT: z.string().transform(Number).default('587'),
+    SMTP_SECURE: z.string().transform(val => val === 'true').default('false'),
+    SMTP_USER: requiredInProduction(z.string().default('dev@example.com')),
+    SMTP_PASS: requiredInProduction(z.string().default('dev-password')),
+    SMTP_FROM: z.string().email().default('noreply@chatapp.com'),
+    SMTP_REPLY_TO: z.string().email().optional(),
+    
+    // Twilio SMS (optional in dev)
+    TWILIO_ACCOUNT_SID: requiredInProduction(z.string().default('dev-account-sid')),
+    TWILIO_AUTH_TOKEN: requiredInProduction(z.string().default('dev-auth-token')),
+    TWILIO_FROM_NUMBER: requiredInProduction(z.string().default('+1234567890')),
+    
+    // Firebase (optional in dev)
+    FIREBASE_PROJECT_ID: requiredInProduction(z.string().default('dev-project')),
+    FIREBASE_PRIVATE_KEY: requiredInProduction(z.string().default('dev-private-key')),
+    FIREBASE_CLIENT_EMAIL: requiredInProduction(z.string().email().default('dev@example.com')),
+    
+    // CoTURN (optional in dev)
+    COTURN_PRIMARY_HOST: z.string().default('turn.example.com'),
+    COTURN_SECRET: requiredInProduction(z.string().default('dev-coturn-secret')),
+    COTURN_REALM: z.string().default('chatapp.com'),
+    COTURN_TTL: z.string().transform(Number).default('86400'),
+    COTURN_FALLBACK_HOSTS: z.string().optional(),
+    
+    // Logging
+    LOG_LEVEL: z.enum(['error', 'warn', 'info', 'debug']).default('info'),
+    
+    // Rate Limiting
+    RATE_LIMIT_REDIS_URL: z.string().optional(),
+    RATE_LIMIT_WINDOW_MS: z.string().transform(Number).default('900000'),
+    RATE_LIMIT_MAX_REQUESTS: z.string().transform(Number).default('100'),
+    
+    // Security
+    ENCRYPTION_KEY: isDevelopment
+      ? z.string().default('dev-encryption-key-must-be-at-least-64-characters-long-for-secure-operations')
+      : z.string().min(64, 'Encryption key must be at least 64 characters'),
+    CORS_ORIGIN: z.string().optional(),
+    ALLOWED_ORIGINS: z.string().optional(),
+    
+    // Monitoring
+    ANALYTICS_ENABLED: z.string().transform(val => val === 'true').default('true'),
+    METRICS_ENABLED: z.string().transform(val => val === 'true').default('true'),
+    HEALTH_CHECK_ENABLED: z.string().transform(val => val === 'true').default('true'),
+  });
+};
+
+export type Environment = z.infer<ReturnType<typeof createEnvSchema>>;
 
 class EnvironmentConfig {
   private config: Environment;
@@ -90,6 +100,9 @@ class EnvironmentConfig {
 
   private loadConfig(): Environment {
     try {
+      const isDevelopment = process.env.NODE_ENV !== 'production';
+      const envSchema = createEnvSchema(isDevelopment);
+      
       // Load from process.env
       const rawConfig = {
         NODE_ENV: process.env.NODE_ENV,
@@ -155,7 +168,7 @@ class EnvironmentConfig {
       const config = envSchema.parse(rawConfig);
       this.isLoaded = true;
       
-      logger.info('Environment configuration loaded successfully', {
+      console.log(`✅ Environment configuration loaded successfully`, {
         environment: config.NODE_ENV,
         port: config.PORT,
         version: config.APP_VERSION,
@@ -163,7 +176,15 @@ class EnvironmentConfig {
 
       return config;
     } catch (error) {
-      logger.error('Failed to load environment configuration', error instanceof Error ? error : new Error(String(error)));
+      console.error('❌ Failed to load environment configuration:', error);
+      
+      if (error instanceof z.ZodError) {
+        console.error('Validation errors:');
+        error.errors.forEach(err => {
+          console.error(`  - ${err.path.join('.')}: ${err.message}`);
+        });
+      }
+      
       throw new Error('Invalid environment configuration');
     }
   }
@@ -196,12 +217,37 @@ class EnvironmentConfig {
     return this.getValue('NODE_ENV') === 'test';
   }
 
-  // Validate required services
+  // Check if service is properly configured
+  isServiceConfigured(service: 'smtp' | 'twilio' | 'aws' | 'firebase' | 'redis'): boolean {
+    const config = this.get();
+    
+    switch (service) {
+      case 'smtp':
+        return !!(config.SMTP_USER && config.SMTP_PASS && config.SMTP_USER !== 'dev@example.com');
+      case 'twilio':
+        return !!(config.TWILIO_ACCOUNT_SID && config.TWILIO_AUTH_TOKEN && config.TWILIO_ACCOUNT_SID !== 'dev-account-sid');
+      case 'aws':
+        return !!(config.AWS_ACCESS_KEY_ID && config.AWS_SECRET_ACCESS_KEY && config.AWS_ACCESS_KEY_ID !== 'dev-access-key');
+      case 'firebase':
+        return !!(config.FIREBASE_PROJECT_ID && config.FIREBASE_PRIVATE_KEY && config.FIREBASE_PROJECT_ID !== 'dev-project');
+      case 'redis':
+        return !!config.REDIS_URL;
+      default:
+        return false;
+    }
+  }
+
+  // Validate required services (only in production)
   validateServices(): void {
+    if (!this.isProduction()) {
+      console.log('⚠️  Development mode: Skipping service validation');
+      return;
+    }
+
     const config = this.get();
     const errors: string[] = [];
 
-    // Check required environment variables based on features
+    // Check required environment variables for production
     if (!config.MONGODB_URI) {
       errors.push('MONGODB_URI is required');
     }
@@ -214,31 +260,11 @@ class EnvironmentConfig {
       errors.push('ENCRYPTION_KEY must be at least 64 characters');
     }
 
-    // AWS S3 validation
-    if (!config.AWS_ACCESS_KEY_ID || !config.AWS_SECRET_ACCESS_KEY || !config.AWS_S3_BUCKET) {
-      errors.push('AWS S3 configuration is incomplete');
-    }
-
-    // SMTP validation
-    if (!config.SMTP_USER || !config.SMTP_PASS) {
-      errors.push('SMTP configuration is incomplete');
-    }
-
-    // Twilio validation
-    if (!config.TWILIO_ACCOUNT_SID || !config.TWILIO_AUTH_TOKEN || !config.TWILIO_FROM_NUMBER) {
-      errors.push('Twilio configuration is incomplete');
-    }
-
-    // Firebase validation
-    if (!config.FIREBASE_PROJECT_ID || !config.FIREBASE_PRIVATE_KEY || !config.FIREBASE_CLIENT_EMAIL) {
-      errors.push('Firebase configuration is incomplete');
-    }
-
     if (errors.length > 0) {
-      throw new Error(`Configuration validation failed:\n${errors.join('\n')}`);
+      throw new Error(`Production configuration validation failed:\n${errors.join('\n')}`);
     }
 
-    logger.info('All service configurations validated successfully');
+    console.log('✅ Production service configurations validated successfully');
   }
 
   // Get database configuration

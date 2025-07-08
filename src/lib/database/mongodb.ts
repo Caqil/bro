@@ -1,4 +1,4 @@
-// ===== lib/database/mongodb.ts =====
+
 import mongoose from 'mongoose';
 
 interface ConnectionCache {
